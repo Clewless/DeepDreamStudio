@@ -1,0 +1,32 @@
+# Pre-commit configuration for formatting, linting, and type-checking.
+# Install with:
+#   .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+#   .venv\Scripts\pre-commit install
+# Note: the markdownlint-cli2 hook requires Node.js (see https://nodejs.org/).
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.22
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.18.1
+    hooks:
+      - id: markdownlint-cli2
+        files: \.md$
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: python scripts/run_mypy.py app tests scripts
+        language: system
+        pass_filenames: false
+        types: [python]
+exclude: '^(\.venv/|out/|__pycache__|.*\.egg-info|\.mypy_cache|\.pytest_cache)'

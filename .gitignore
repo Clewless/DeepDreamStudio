@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.hypothesis/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environment
+.venv/
+
+# Generated content
+out/
+
+# DeepDream transient temps (atomic saves, video encodes, live previews).
+# Normally under out/, but --out / --frames-dir / --preview-file can point
+# anywhere, so ignore by pattern too.
+*.tmp
+*.temp.mp4
+_gui_preview*.png
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Model weights / checkpoints
+*.pth
+*.pt
+*.onnx
+*.ckpt
+*.safetensors
+
+# Extra virtual environments
+venv/
+env/
+
+# Editors / backups / AI agents
+.idea/
+.vscode/
+.cursor/
+.cursorrules
+.windsurf/
+.windsurfrules
+.gemini/
+.claude/
+.copilot/
+.aider*
+*.audit.md
+scratch/
+*.swp
+*.swo
+*~
+*.bak
+*.old
+*.orig
+
+# Logs / coverage / build
+*.log
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+.tox/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# First-launch dependency verification marker
+.deps_ok
+
+
+# Renamed broken virtualenvs (kept, then removed by hand)
+.venv.bad-*/
+

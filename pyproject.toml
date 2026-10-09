@@ -1,0 +1,151 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepdream-studio"
+# Single source of truth: app/__init__.py. Bump __version__ there.
+dynamic = ["version"]
+description = "A PyTorch GUI and command-line implementation of DeepDream"
+readme = "README.md"
+authors = [{ name = "Clewless", email = "20273340+Clewless@users.noreply.github.com" }]
+maintainers = [{ name = "Clewless", email = "20273340+Clewless@users.noreply.github.com" }]
+keywords = ["deepdream", "deep-dream", "pytorch", "cuda", "generative-art", "inception", "vgg"]
+license = "BSD-3-Clause"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.11,<3.15"
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: X11 Applications",
+  "Environment :: MacOS X",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Artistic Software",
+  "Topic :: Multimedia :: Graphics",
+]
+# Mirrors requirements.txt; the CUDA build is pinned in requirements-cuda.txt.
+# tkinter is part of the Python distribution and cannot be declared here.
+dependencies = [
+  "torch>=2.4.1",
+  "torchvision>=0.19.1",
+  "numpy>=2.0",
+  "pillow>=10.0",
+  "tkinterdnd2>=0.3.0",
+  "imageio>=2.31",
+  "imageio-ffmpeg>=0.4.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/Clewless/DeepDreamStudio"
+Repository = "https://github.com/Clewless/DeepDreamStudio"
+Issues = "https://github.com/Clewless/DeepDreamStudio/issues"
+Changelog = "https://github.com/Clewless/DeepDreamStudio/releases"
+
+[project.optional-dependencies]
+dev = [
+  "hypothesis>=6.100",
+  "mypy>=1.8",
+  "ruff>=0.5",
+  "pre-commit>=3.6",
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+]
+
+[project.scripts]
+deepdream = "app.deepdream:main"
+deepdream-studio = "app.gui:main"
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.setuptools.dynamic]
+version = { attr = "app.__version__" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [".venv", "out", "__pycache__", ".mypy_cache", ".pytest_cache"]
+
+[tool.ruff.lint]
+# E/W: spacing + line length, F: dead/broken code (pyflakes),
+# I: import sorting, N: naming, UP: outdated Python syntax, B: common bugs,
+# SIM: simplify, C4: comprehensions, RUF: ruff-specific, A: builtins.
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "C4", "RUF", "A"]
+ignore = [
+  "E501",   # line-too-long: ruff format handles wrapping; avoids double warnings
+  "N812",   # `import torch.nn.functional as F` is the universal PyTorch convention
+  "SIM105", # suppressible-exception: try/except/pass is standard and clearer in cleanups
+  "SIM108", # ternary operator: forcing ternaries harms readability for complex branches
+  "SIM117", # multiple with statements: nesting is clearer for complex mock contexts
+  "RUF001", # ambiguous characters: flags valid UI text symbols like unicode minus
+  "RUF046", # unnecessary cast to int: defensive casting before Tkinter APIs
+  "RUF059", # unused unpacked variable: common and readable in test helper unpacking
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+# 3.12: the lint env runs 3.12, and numpy>=2.5 stubs use PEP 695 `type`
+# syntax, which mypy cannot even parse with a 3.11 target ("Type statement
+# is only supported in Python 3.12 and greater"). Runtime 3.11
+# compatibility is still guarded by ruff's UP rules (target py311) and by
+# the CI test jobs, which run on 3.11.
+python_version = "3.12"
+check_untyped_defs = true
+show_error_codes = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+exclude = '\\.venv/|out/|__pycache__|\\.mypy_cache|\\.pytest_cache'
+
+[[tool.mypy.overrides]]
+module = [
+  "torchvision.*",
+  "imageio_ffmpeg.*",
+  "tkinterdnd2.*",
+]
+ignore_missing_imports = true
+
+# numpy ships its own stubs, and newer releases trip new-mypy checks
+# inside those stubs (e.g. hundreds of overload-overlap notes). Silence
+# errors located in numpy's files; errors in our own code that involve
+# numpy types are still reported.
+[[tool.mypy.overrides]]
+module = ["numpy.*"]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["."]
+filterwarnings = [
+  "ignore:.*vendored tifffile backend is deprecated.*:DeprecationWarning",
+]
+markers = [
+  "integration: runs the full engine end-to-end in-process or as a subprocess (slower)",
+  "gui: constructs a Tk window and needs a display",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["app"]
+# GUI tests are skipped without a display, which would look like missing coverage.
+omit = ["app/imagenet_categories.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+]

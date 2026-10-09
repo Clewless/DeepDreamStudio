@@ -1,0 +1,10 @@
+# Dev-only quality tools. Install with:
+#   .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+# Pinned to specific versions so linting and type checks run identically across environments.
+# Runtime deps stay in requirements.txt; this file never ships to users.
+hypothesis==6.168.5
+mypy==2.3.0
+ruff==0.15.22
+pre-commit==4.5.1
+pytest==9.1.1
+pytest-cov==7.1.0

@@ -1,0 +1,11 @@
+{
+  // Ignore vendored/cached output so "**/*.md" is safe to run locally as well as in CI.
+  "ignores": [".venv/**", "out/**", ".mypy_cache/**", ".pytest_cache/**", ".ruff_cache/**", "**/*.egg-info/**"],
+  "config": {
+    "default": true,
+    // MD013 (line-length): README uses long unwrapped prose lines.
+    "MD013": false,
+    // MD036 (no-emphasis-as-heading): README uses bold labels like **Windows (PowerShell):** as section labels.
+    "MD036": false
+  }
+}
