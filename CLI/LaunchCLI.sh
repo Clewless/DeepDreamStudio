@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # DeepDream Studio - optional one-shot command-line preset.
-# For normal use, launch the GUI with ./LaunchDeepDreamStudio.sh instead.
+# For normal use, launch the GUI with ./Launch.sh (in the parent folder) instead.
 set -e
 
 if [ -z "$1" ]; then
     echo "This is the optional one-shot command-line preset."
-    echo "To launch DeepDream Studio normally, run ./LaunchDeepDreamStudio.sh."
+    echo "To launch DeepDream Studio normally, run ./Launch.sh in the parent folder."
     echo ""
-    echo "Usage: ./LaunchDeepDreamCLI.sh <image_path>"
+    echo "Usage: ./CLI/LaunchCLI.sh <image_path>"
     exit 1
 fi
 
 if [ -n "$2" ]; then
-    echo "ERROR: LaunchDeepDreamCLI.sh accepts one image at a time and uses the preset in this script."
+    echo "ERROR: LaunchCLI.sh accepts one image at a time and uses the preset in this script."
     echo "Use the CLI directly (python -m app.deepdream) for batches or custom options."
     exit 1
 fi
@@ -23,17 +23,20 @@ else
     IMG="$(pwd)/$1"
 fi
 
+# Script lives in CLI/, so the repo root is one level up.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Setup creates .venv alongside this launcher, so fail with a useful message
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Setup creates .venv alongside the main launcher, so fail with a useful message
 # rather than exposing a cryptic venv/pip permission error.
-if ! ( : > "$SCRIPT_DIR/.deepdream-write-test" ) 2>/dev/null; then
-    echo "ERROR: This folder is not writable: $SCRIPT_DIR"
+if ! ( : > "$REPO_DIR/.deepdream-write-test" ) 2>/dev/null; then
+    echo "ERROR: This folder is not writable: $REPO_DIR"
     echo "Move or extract DeepDream Studio to a folder you own, such as Documents,"
     echo "then run this launcher again. Setup needs to create a .venv folder here."
     exit 1
 fi
-rm -f "$SCRIPT_DIR/.deepdream-write-test"
-cd "$SCRIPT_DIR"
+rm -f "$REPO_DIR/.deepdream-write-test"
+cd "$REPO_DIR"
 
 # Find a supported Python interpreter to run the bootstrap. Python 3.14 is
 # excluded on macOS. Versioned names
@@ -48,8 +51,8 @@ for candidate in python3.14 python3.13 python3.12 python3.11 python3 python; do
         fi
     fi
 done
-if [ -z "$BOOTSTRAP_PY" ] && [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
-    BOOTSTRAP_PY="$SCRIPT_DIR/.venv/bin/python"
+if [ -z "$BOOTSTRAP_PY" ] && [ -x "$REPO_DIR/.venv/bin/python" ]; then
+    BOOTSTRAP_PY="$REPO_DIR/.venv/bin/python"
 fi
 if [ -z "$BOOTSTRAP_PY" ]; then
     echo "ERROR: No supported Python was found (3.11-3.14; macOS supports 3.11-3.13)."
@@ -58,11 +61,11 @@ if [ -z "$BOOTSTRAP_PY" ]; then
     echo "  Fedora/RHEL:    sudo dnf install python3"
     echo "  Arch Linux:     sudo pacman -S python"
     echo "  macOS:          brew install python@3.13"
-    echo "See README.md \"Install\" for details."
+    echo "See ../README.md \"Install\" for details."
     exit 1
 fi
 
-"$BOOTSTRAP_PY" "$SCRIPT_DIR/app/bootstrap.py" || exit 1
+"$BOOTSTRAP_PY" "$REPO_DIR/app/bootstrap.py" || exit 1
 
 MODEL="vgg16"
 LAYER="features.22"
@@ -79,4 +82,4 @@ echo "   (first run downloads ~528 MB VGG16 weights)"
 echo "============================================"
 echo ""
 
-exec "$SCRIPT_DIR/.venv/bin/python" -m app.deepdream --model "$MODEL" --layer "$LAYER" --iterations "$ITER" --octaves "$OCT" --size "$SIZE" -- "$IMG"
+exec "$REPO_DIR/.venv/bin/python" -m app.deepdream --model "$MODEL" --layer "$LAYER" --iterations "$ITER" --octaves "$OCT" --size "$SIZE" -- "$IMG"

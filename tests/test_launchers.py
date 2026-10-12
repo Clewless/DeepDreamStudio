@@ -17,8 +17,8 @@ from unittest import mock
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SH_LAUNCHERS = ["LaunchDeepDreamStudio.sh", "LaunchDeepDreamCLI.sh"]
-BAT_LAUNCHERS = ["LaunchDeepDreamStudio.bat", "LaunchDeepDreamCLI.bat"]
+SH_LAUNCHERS = ["Launch.sh", "CLI/LaunchCLI.sh"]
+BAT_LAUNCHERS = ["Launch.bat", "CLI/LaunchCLI.bat"]
 
 
 def _read(name: str) -> str:
@@ -160,11 +160,11 @@ class GuidanceTests(unittest.TestCase):
         with mock.patch.object(bootstrap.sys, "platform", "darwin"):
             guidance = "\n".join(bootstrap.install_guidance(gui=True))
         self.assertIn("python-tk@", guidance)
-        self.assertIn("python-tk@", _read("LaunchDeepDreamStudio.sh"))
+        self.assertIn("python-tk@", _read("Launch.sh"))
         self.assertIn("python-tk@3.13", guidance)
 
     def test_python_not_found_message_names_tk_for_every_distro(self):
-        text = _read("LaunchDeepDreamStudio.sh")
+        text = _read("Launch.sh")
         for expected in ("python3-tk", "python3-tkinter", "pacman", "python-tk@"):
             with self.subTest(expected=expected):
                 self.assertIn(expected, text)
@@ -180,6 +180,58 @@ class WritableFolderGuidanceTests(unittest.TestCase):
                 self.assertIn("not writable", text)
                 self.assertIn("documents", text)
                 self.assertIn(".venv", text)
+
+
+class RepoRootRedirectionTests(unittest.TestCase):
+    """CLI launchers live in CLI/ but must operate on the repo root."""
+
+    def test_root_launchers_do_not_use_repo_dir(self):
+        for name in ("Launch.sh", "Launch.bat"):
+            with self.subTest(launcher=name):
+                self.assertNotIn("REPO_DIR", _read(name))
+
+    def test_cli_shell_launcher_uses_repo_dir(self):
+        text = _read("CLI/LaunchCLI.sh")
+        for expected in (
+            'REPO_DIR="$(dirname "$SCRIPT_DIR")"',
+            'cd "$REPO_DIR"',
+            '"$REPO_DIR/app/bootstrap.py"',
+            '"$REPO_DIR/.venv/bin/python"',
+            '"$REPO_DIR/.deepdream-write-test"',
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, text)
+        for forbidden in (
+            'cd "$SCRIPT_DIR"',
+            '"$SCRIPT_DIR/app/bootstrap',
+            '"$SCRIPT_DIR/.venv',
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, text)
+
+    def test_cli_bat_launcher_uses_repo_dir(self):
+        text = _read("CLI/LaunchCLI.bat")
+        for expected in (
+            'cd /d "%REPO_DIR%"',
+            '"%REPO_DIR%.deepdream-write-test"',
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, text)
+        # %~dp0 may only appear when defining REPO_DIR itself.
+        without_repo_dir_def = "\n".join(ln for ln in text.splitlines() if "REPO_DIR" not in ln)
+        self.assertNotIn("%~dp0", without_repo_dir_def)
+        self.assertNotIn("%SCRIPT_DIR%", without_repo_dir_def)
+
+    def test_cli_bat_launcher_resolves_repo_dir_to_a_real_path(self):
+        """The .bat must normalize "...\\CLI\\.." rather than echoing it back.
+
+        REPO_DIR is shown to the user in the not-writable error, so a raw
+        "%~dp0..\\" would tell someone to move the folder to a path containing
+        a "..", which is not a path they can act on. The .sh gets this for free
+        from dirname, so the two launchers must agree on the resolved value.
+        """
+        text = _read("CLI/LaunchCLI.bat")
+        self.assertIn('for %%I in ("%~dp0..") do set "REPO_DIR=%%~fI\\"', text)
 
 
 class BootstrapSmokeTests(unittest.TestCase):

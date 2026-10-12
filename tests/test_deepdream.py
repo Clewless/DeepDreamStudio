@@ -84,13 +84,13 @@ class TestDeepDream(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_windows_launcher_quotes_single_dropped_path(self):
-        with open(REPO_ROOT / "LaunchDeepDreamCLI.bat", encoding="utf-8") as fh:
+        with open(REPO_ROOT / "CLI" / "LaunchCLI.bat", encoding="utf-8") as fh:
             launcher = fh.read()
         self.assertIn('-- "%IMG%"', launcher)
         self.assertNotIn("%*", launcher)
 
     def test_windows_studio_launcher_resolves_image_and_quotes(self):
-        with open(REPO_ROOT / "LaunchDeepDreamStudio.bat", encoding="utf-8") as fh:
+        with open(REPO_ROOT / "Launch.bat", encoding="utf-8") as fh:
             launcher = fh.read()
         self.assertIn('set "IMG_ARG=%~f1"', launcher)
         self.assertIn('"%IMG_ARG%"', launcher)

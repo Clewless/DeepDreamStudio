@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DeepDream Studio - main launcher (GUI).
-# Run from a terminal:  ./LaunchDeepDreamStudio.sh
+# Run from a terminal:  ./Launch.sh
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

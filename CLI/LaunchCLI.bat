@@ -2,11 +2,11 @@
 setlocal
 
 rem DeepDream Studio - optional one-shot command-line preset.
-rem For normal use, launch the GUI with "LaunchDeepDreamStudio.bat" instead.
+rem For normal use, launch the GUI with "Launch.bat" (in the parent folder) instead.
 
 if "%~1"=="" (
     echo This is the optional one-shot command-line preset.
-    echo To launch DeepDream Studio normally, run "LaunchDeepDreamStudio.bat".
+    echo To launch DeepDream Studio normally, run "Launch.bat" in the parent folder.
     echo.
     echo Or drag an image file onto this script to dream it with the preset.
     pause
@@ -14,26 +14,29 @@ if "%~1"=="" (
 )
 
 if not "%~2"=="" (
-    echo ERROR: LaunchDeepDreamCLI.bat accepts one image at a time and uses the preset in this script.
+    echo ERROR: LaunchCLI.bat accepts one image at a time and uses the preset in this script.
     echo Use the CLI directly ^(python -m app.deepdream^) for batches or custom options.
     pause
     exit /b 1
 )
 
 set "IMG=%~f1"
-cd /d "%~dp0"
+rem Script lives in CLI\, so the repo root is one level up. Resolve it fully so
+rem the not-writable message below shows a real path instead of "...\CLI\..\".
+for %%I in ("%~dp0..") do set "REPO_DIR=%%~fI\"
+cd /d "%REPO_DIR%"
 
-rem .venv is created beside the launcher. Give newcomers a clear error if they
+rem .venv is created beside the main launcher. Give newcomers a clear error if they
 rem try to run from a read-only location such as Program Files or an archive.
-2>nul ( >"%~dp0.deepdream-write-test" echo test )
-if not exist "%~dp0.deepdream-write-test" (
-    echo ERROR: This folder is not writable: "%~dp0"
+2>nul ( >"%REPO_DIR%.deepdream-write-test" echo test )
+if not exist "%REPO_DIR%.deepdream-write-test" (
+    echo ERROR: This folder is not writable: "%REPO_DIR%"
     echo Move or extract DeepDream Studio to a folder you own, such as Documents,
     echo then run this launcher again. Setup needs to create a .venv folder here.
     pause
     exit /b 1
 )
-del "%~dp0.deepdream-write-test" >nul 2>nul
+del "%REPO_DIR%.deepdream-write-test" >nul 2>nul
 
 rem Find a Python 3.11-3.14 interpreter to run the bootstrap. Versioned names
 rem are tried first so a default "python" pointing at an older (or newer,
@@ -62,7 +65,7 @@ if not defined PY (
     echo   winget install Python.Python.3.14
     echo   or https://www.python.org/downloads/ ^(tick "Add python.exe to PATH"^)
     echo.
-    echo See README.md "Install" for details.
+    echo See README.md in the parent folder "Install" for details.
     pause
     exit /b 1
 )
