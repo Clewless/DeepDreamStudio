@@ -19,25 +19,50 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torchvision.models as models
-from PIL import Image, ImageOps
+from PIL import Image
 
-from . import __version__
+from . import __version__, dream_engine
+from .dream_engine import MAX_OCTAVES as MAX_OCTAVES
+from .dream_engine import (
+    MIN_OCTAVE_SIZE,
+    TARGET_BASE_SIZE,
+    DreamCallbacks,
+    GuideFeatures,
+    plan_octaves,
+    validate_input_size,
+)
+from .dream_engine import auto_octave_count as auto_octave_count
+from .dream_engine import octave_truncation_note as octave_truncation_note
+from .dream_engine import resize as resize
+from .media_io import (
+    MEAN,
+    load_image,
+    load_image_native_size,
+    load_image_with_size,
+    pil_to_tensor,
+    resize_dims,
+    save_image,
+    save_preview_frame,
+    tensor_to_np,
+    tensor_to_pil,
+)
+from .media_io import STD as STD
+from .media_io import atomic_tmp_path as _atomic_tmp_path
+from .media_io import load_pil_image as load_pil_image
+from .media_io import publish_video as _publish_video
+from .media_io import remove_stale_temps as _remove_stale_temps
+from .media_io import save_frame_atomic as _save_frame_atomic
 from .model_data import (
     MAX_NAME_LEN,
     MIN_TORCH_VERSION,
-    MODEL_DEFAULTS,
-    MODEL_DESCRIPTIONS,
-    MODEL_LAYERS,
     MODEL_MIN_SIZE,
-    MODEL_ORDER,
-    MODEL_RECOMMENDED,
     VIDEO_EXTENSIONS,
     VIDEO_QUALITY_PRESETS,
     build_systematic_video_name,
@@ -47,6 +72,16 @@ from .model_data import (
     resume_mismatches,
     write_video_frames_meta,
 )
+from .models import (
+    MODEL_REGISTRY,
+    Device,
+    build_model,
+    forward_with_activations,
+    resolve_layer,
+    run_to_layers,
+)
+from .models import _forward_googlenet as _forward_googlenet
+from .models import build_googlenet as build_googlenet
 from .protocol import (
     EV_DONE,
     EV_FRAME,
@@ -120,192 +155,14 @@ _NO_WINDOW: dict[str, Any] = (
     {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32" else {}
 )
 
-MEAN = [0.485, 0.456, 0.406]
-STD = [0.229, 0.224, 0.225]
-
-
-def _freeze(m):
-    """Put a model in inference mode with gradients off, as dreaming requires."""
-    m.eval()
-    for p in m.parameters():
-        p.requires_grad_(False)
-    return m
-
-
-def build_googlenet(device, weights=True):
-    """GoogLeNet on *device*.
-
-    weights=False skips the download and uses random initialization: tests need
-    the layer structure and forward/backward behaviour, not trained features,
-    and should not require network access to run.
-    """
-    if weights:
-        m = models.googlenet(weights=models.GoogLeNet_Weights.IMAGENET1K_V1).to(device)
-        m.aux_logits = False
-    else:
-        m = models.googlenet(weights=None, aux_logits=True, init_weights=True).to(device)
-        m.aux_logits = False
-    return _freeze(m)
-
-
-def _forward_trunk(model, x, target_set, is_aux):
-    """Forward through a model's direct children, capturing target activations.
-    Stops after the deepest target; _transform_input() is re-applied first because
-    it is a tensor op, not a child module, so walking children would skip it."""
-    if getattr(model, "transform_input", False) and hasattr(model, "_transform_input"):
-        x = model._transform_input(x)
-    children = list(model.named_children())
-    names = [n for n, _ in children]
-    missing = target_set - set(names)
-    if missing:
-        raise RuntimeError(f"Target layer(s) not found in model: {sorted(missing)}")
-    aux_targets = sorted(n for n in target_set if is_aux(n))
-    if aux_targets:
-        raise RuntimeError(
-            f"Target layer(s) are auxiliary heads, not dreamable trunk layers: {aux_targets}"
-        )
-    deepest = max(i for i, n in enumerate(names) if n in target_set)
-    stop_at = names[deepest + 1] if deepest + 1 < len(names) else None
-    acts = {}
-    for name, module in children:
-        if name == stop_at:
-            break
-        # Auxiliary heads are side branches; skip them to stay on the trunk.
-        if is_aux(name):
-            continue
-        x = module(x)
-        if name in target_set:
-            acts[name] = x
-            if len(acts) == len(target_set):
-                break
-    missing = target_set - set(acts.keys())
-    if missing:
-        raise RuntimeError(f"Target layer(s) not found in model: {sorted(missing)}")
-    return acts
-
-
-def _forward_googlenet(model, x, target_set):
-    """GoogLeNet trunk walk; its auxiliary heads are named aux1/aux2."""
-    return _forward_trunk(model, x, target_set, lambda n: n.startswith("aux"))
-
-
-def _build_inceptionv3(device):
-    m = models.inception_v3(weights=models.Inception_V3_Weights.IMAGENET1K_V1).to(device)
-    # Auxiliary classifier output is not used for DeepDream feature extraction.
-    m.aux_logits = False
-    m.eval()
-    for p in m.parameters():
-        p.requires_grad_(False)
-    return m
-
-
-def _forward_inceptionv3(model, x, target_set):
-    """InceptionV3 trunk walk; its auxiliary branch is named AuxLogits."""
-    return _forward_trunk(model, x, target_set, lambda n: n == "AuxLogits")
-
-
-def _build_vgg(variant, device):
-    """Build a VGG16 or VGG19 model with pretrained ImageNet weights."""
-    if variant == "vgg16":
-        m = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).to(device)
-    else:
-        m = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).to(device)
-    m.eval()
-    for p in m.parameters():
-        p.requires_grad_(False)
-    return m
-
-
-def _forward_vgg(model, x, target_set):
-    """Run VGG's features block, stopping at the deepest target.
-    Targets are "features.N" indices into model.features; avgpool and classifier
-    are never run."""
-    idx_to_name = {}
-    for name in target_set:
-        if not name.startswith("features."):
-            raise RuntimeError(
-                f"VGG target '{name}' must be in the form 'features.N' (e.g. 'features.28')."
-            )
-        parts = name.split(".")
-        if len(parts) != 2:
-            raise RuntimeError(f"Cannot parse layer index from '{name}'.") from None
-        try:
-            idx = int(parts[1])
-        except ValueError:
-            raise RuntimeError(f"Cannot parse layer index from '{name}'.") from None
-        idx_to_name[idx] = name
-
-    # Reject out-of-range indices before running the forward pass.
-    try:
-        num_features = len(model.features)
-    except TypeError:
-        num_features = None
-    if num_features is not None:
-        bad = sorted(name for idx, name in idx_to_name.items() if idx < 0 or idx >= num_features)
-        if bad:
-            raise RuntimeError(f"Target layer(s) not found in model.features: {bad}")
-
-    deepest_idx = max(idx_to_name)
-    acts = {}
-    for i, layer in enumerate(model.features):
-        x = layer(x)
-        if i in idx_to_name:
-            acts[idx_to_name[i]] = x
-        if i >= deepest_idx:
-            break
-    missing = target_set - set(acts.keys())
-    if missing:
-        raise RuntimeError(f"Target layer(s) not found in model.features: {sorted(missing)}")
-    return acts
-
-
-# Layer labels, defaults, and quality presets live in model_data.py; only the
-# torch-dependent pieces (build and truncated forward) are registered here.
-_MODEL_IMPLS = {
-    "googlenet": (build_googlenet, _forward_googlenet),
-    "inceptionv3": (_build_inceptionv3, _forward_inceptionv3),
-    "vgg16": (lambda device: _build_vgg("vgg16", device), _forward_vgg),
-    "vgg19": (lambda device: _build_vgg("vgg19", device), _forward_vgg),
-}
-
-MODEL_REGISTRY: dict[str, dict[str, Any]] = {}
-for _model_key in MODEL_ORDER:
-    _build_fn, _forward_fn = _MODEL_IMPLS[_model_key]
-    MODEL_REGISTRY[_model_key] = {
-        "description": MODEL_DESCRIPTIONS[_model_key],
-        "layers": list(MODEL_LAYERS[_model_key]),
-        "recommended": MODEL_RECOMMENDED[_model_key],
-        "build": _build_fn,
-        "forward_fn": _forward_fn,
-        "min_size": MODEL_MIN_SIZE[_model_key],
-        "defaults": dict(MODEL_DEFAULTS[_model_key]),
-    }
-
 DEFAULT_MODEL = "vgg16"
-
-# TensorFlow-era layer name aliases (GoogLeNet only, kept for back-compat).
-TF_LAYER_MAP = {
-    "mixed3a": "inception3a",
-    "mixed3b": "inception3b",
-    "mixed4a": "inception4a",
-    "mixed4b": "inception4b",
-    "mixed4c": "inception4c",
-    "mixed4d": "inception4d",
-    "mixed4e": "inception4e",
-    "mixed5a": "inception5a",
-    "mixed5b": "inception5b",
-}
+_activation_loss = dream_engine.activation_loss
 
 # Filename-stem validation lives in model_data.py (shared with the GUI).
 # Windows classic MAX_PATH is 260, macOS PATH_MAX is 1024, and Linux allows
 # 4096. Using the Linux figure everywhere else disables the pre-flight check on
 # the platform with the shortest limit, where deeply nested paths are common.
 MAX_PATH = 260 if sys.platform == "win32" else (1024 if sys.platform == "darwin" else 4096)
-
-MAX_OCTAVES = 25
-# An octave whose short edge would drop below this is not built.
-MIN_OCTAVE_SIZE = 32
-TARGET_BASE_SIZE = 250
 
 # Valid ffmpeg -preset values for H.264, checked by resolve_video_quality().
 FFMPEG_PRESETS = frozenset(
@@ -368,172 +225,6 @@ def ensure_output_dir(path):
         os.makedirs(path, exist_ok=True)
     except OSError as exc:
         raise SystemExit(f"Error: could not create output directory '{path}': {exc}") from exc
-
-
-def resolve_layer(name, model_key):
-    """Resolve a layer name (or TF alias) to a canonical key for the given model."""
-    if model_key not in MODEL_REGISTRY:
-        raise SystemExit(f"Unknown model '{model_key}'. Valid models: {sorted(MODEL_REGISTRY)}")
-    name = name.strip()
-    # Apply TF alias map (GoogLeNet only).
-    canonical = TF_LAYER_MAP.get(name.lower(), name)
-    valid_keys = {key for key, _ in MODEL_REGISTRY[model_key]["layers"]}
-    if canonical in valid_keys:
-        return canonical
-    # Lower-case fallback for googlenet inception names.
-    for key in valid_keys:
-        if key.lower() == canonical.lower():
-            return key
-    valid_list = sorted(valid_keys)
-    raise SystemExit(f"Unknown layer '{name}' for model '{model_key}'. Valid layers: {valid_list}")
-
-
-def build_model(model_key, device):
-    """Load and return the model for the given registry key."""
-    if model_key not in MODEL_REGISTRY:
-        raise SystemExit(f"Unknown model '{model_key}'. Valid models: {sorted(MODEL_REGISTRY)}")
-    return MODEL_REGISTRY[model_key]["build"](device)
-
-
-def run_to_layers(model, model_key, x, targets):
-    """Forward pass through the model, capturing activations at each target layer."""
-    if model_key not in MODEL_REGISTRY:
-        raise SystemExit(f"Unknown model '{model_key}'. Valid models: {sorted(MODEL_REGISTRY)}")
-    target_set = set(targets)
-    if not target_set:
-        raise RuntimeError("No target layers specified.")
-    forward_fn = MODEL_REGISTRY[model_key]["forward_fn"]
-    return forward_fn(model, x, target_set)
-
-
-def _module_for_target(model, name):
-    """Resolve a target name ('inception4c' or 'features.22') to its module."""
-    module = model
-    for part in name.split("."):
-        module = module[int(part)] if part.isdigit() else getattr(module, part)
-    return module
-
-
-def forward_with_activations(model, x, targets):
-    """Run one full forward pass, capturing target activations with hooks."""
-    acts = {}
-    handles = []
-
-    def capture(name):
-        def hook(_module, _inputs, output):
-            acts[name] = output
-
-        return hook
-
-    unresolved = []
-    try:
-        for name in dict.fromkeys(targets):
-            try:
-                module = _module_for_target(model, name)
-            except (AttributeError, IndexError, KeyError, TypeError, ValueError):
-                unresolved.append(name)
-                continue
-            handles.append(module.register_forward_hook(capture(name)))
-        if unresolved:
-            raise RuntimeError(f"Target layer(s) not found in model: {sorted(unresolved)}")
-        logits = model(x)
-    finally:
-        for handle in handles:
-            handle.remove()
-    missing = set(targets) - set(acts)
-    if missing:
-        raise RuntimeError(f"Target layer(s) not found in model: {sorted(missing)}")
-    return acts, logits
-
-
-def _activation_loss(acts, guide_features):
-    """Feature-amplification or guide-matching loss over captured activations.
-    Unguided: 0.5 * sum(a**2). Guided: cosine similarity between per-location
-    normalized image and guide features, each scored at its nearest guide feature."""
-    if not acts:
-        raise RuntimeError("No activations captured: no target layers were run.")
-    if guide_features:
-        total = None
-        for name, a in acts.items():
-            if name not in guide_features:
-                continue
-            fx = a[0].reshape(a.shape[1], -1)  # (C, Nx)
-            fx_norm = fx / (fx.norm(p=2, dim=0, keepdim=True) + 1e-7)
-            sim = torch.mm(fx_norm.t(), guide_features[name])  # (Nx, Ng)
-            best_sim, _ = sim.max(dim=1)
-            total = best_sim.sum() if total is None else total + best_sim.sum()
-        if total is not None:
-            return total
-        raise RuntimeError(
-            "Guide features were supplied but none overlap the captured "
-            f"layer(s) {sorted(acts)} (guide feature layers: {sorted(guide_features)}). "
-            "A guide dream would otherwise run silently with no guide effect."
-        )
-    return 0.5 * sum((a**2).sum() for a in acts.values())
-
-
-def resize_dims(size, max_size):
-    """Target (w, h) when downscaling to max_size is needed, else None."""
-    w, h = size
-    if max_size and max_size > 0:
-        scale = max_size / max(w, h)
-        if scale < 1.0:
-            return (max(1, round(w * scale)), max(1, round(h * scale)))
-    return None
-
-
-def load_pil_image(path):
-    """Open an image, apply EXIF orientation, and convert it to RGB."""
-    with Image.open(path) as raw_img:
-        return ImageOps.exif_transpose(raw_img).convert("RGB")
-
-
-def load_image_native_size(path):
-    """Native (w, h) from the image header, without decoding pixel data.
-    EXIF rotation preserves min/max edge length, so validation and naming need
-    no second decode."""
-    with Image.open(path) as raw_img:
-        return raw_img.size
-
-
-def load_image_with_size(path, max_size):
-    """Load an image plus its native (w, h), from a single file open."""
-    img = load_pil_image(path)
-    native_size = img.size
-    new_size = resize_dims(img.size, max_size)
-    if new_size:
-        img = img.resize(new_size, getattr(Image, "Resampling", Image).LANCZOS)
-    return pil_to_tensor(img), native_size
-
-
-def load_image(path, max_size):
-    return load_image_with_size(path, max_size)[0]
-
-
-def tensor_to_np(t):
-    t = t.detach().clone().cpu().float()
-    if t.dim() == 4:
-        if t.shape[0] != 1:
-            raise ValueError(
-                f"tensor_to_np expects a single image (batch==1), got shape {tuple(t.shape)}"
-            )
-        t = t[0]
-    for c in range(3):
-        t[c] = t[c] * STD[c] + MEAN[c]
-    t = t.clamp(0, 1).mul(255).round().byte()
-    return t.permute(1, 2, 0).numpy()
-
-
-def pil_to_tensor(img):
-    arr = np.asarray(img, dtype="float32") / 255.0
-    mean = np.array(MEAN, dtype="float32")
-    std = np.array(STD, dtype="float32")
-    arr = (arr - mean) / std
-    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-
-
-def tensor_to_pil(t):
-    return Image.fromarray(tensor_to_np(t))
 
 
 def apply_zoom_and_rotate(t, zoom_scale=1.03, zoom_rot=0.0, zoom_cx=0.5, zoom_cy=0.5):
@@ -695,21 +386,6 @@ def extract_guide_features(model, model_key, guide_path, targets, device, max_si
     return guide_features
 
 
-def _atomic_tmp_path(path, suffix=".tmp"):
-    """Pid-suffixed sibling temp path, so concurrent writers never share a temp file."""
-    return f"{path}.p{os.getpid()}{suffix}"
-
-
-def _remove_stale_temps(*paths):
-    """Best-effort removal of temp files left by a previous (crashed) run."""
-    for path in paths:
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-
 def _count_resumable_frames(frames_dir, limit=None):
     """Count the leading run of readable frame_*.png files. The first unreadable
     frame (a write cut short by a kill) is removed so it gets regenerated."""
@@ -818,98 +494,6 @@ def _open_video_writer(path, fps, output_params):
     )
 
 
-def _publish_video(temp_out, out_path, what="video"):
-    """Atomically move a completed encode from its temp file to *out_path*.
-    A locked destination is reported (the temp file is preserved) and re-raised,
-    so the caller can keep the temp and skip cleanup."""
-    try:
-        os.replace(temp_out, out_path)
-    except PermissionError:
-        print(
-            f"Warning: Destination file '{out_path}' is locked by another program. "
-            f"Completed {what} preserved at '{temp_out}'.",
-            file=sys.stderr,
-            flush=True,
-        )
-        raise
-
-
-def _save_frame_atomic(frame_np, frames_dir, index):
-    """Save one sequence frame as frame_NNNNNN.png via temp file + rename."""
-    temp_frame = os.path.join(frames_dir, f".frame_{index:06d}.tmp.png")
-    Image.fromarray(frame_np).save(temp_frame, format="PNG")
-    os.replace(temp_frame, os.path.join(frames_dir, f"frame_{index:06d}.png"))
-
-
-def save_image(t, path, warn_on_overwrite=False):
-    dirname = os.path.dirname(path)
-    if dirname:
-        os.makedirs(dirname, exist_ok=True)
-    if warn_on_overwrite and os.path.exists(path):
-        print(
-            f"Warning: output file '{path}' already exists and will be "
-            "overwritten. Use --name or --out to keep the previous result.",
-            file=sys.stderr,
-            flush=True,
-        )
-    arr = tensor_to_np(t)
-    img = Image.fromarray(arr)
-    # Encode to a sibling temp file and rename on success so a failure (disk
-    # full, interrupt) never truncates a pre-existing image at `path`.
-    fmt = Image.registered_extensions().get(os.path.splitext(path)[1].lower())
-    if not fmt:
-        fmt = "PNG"
-    tmp_path = _atomic_tmp_path(path, ".tmp")
-    keep_temp = False
-    try:
-        img.save(tmp_path, format=fmt)
-        try:
-            os.replace(tmp_path, path)
-        except PermissionError:
-            keep_temp = True
-            print(
-                f"Warning: Destination file '{path}' is locked by another process. "
-                f"Rendered image preserved at '{tmp_path}'.",
-                file=sys.stderr,
-                flush=True,
-            )
-            raise
-    except BaseException:
-        if not keep_temp:
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
-        raise
-
-
-def save_preview_frame(frame_np, preview_file):
-    """Atomically write a uint8 (H,W,3) preview frame so a concurrent GUI
-    reader never sees a torn file. Best-effort: returns False on recoverable
-    failure, never raises (Interrupt/SystemExit still propagate)."""
-    tmp_path = _atomic_tmp_path(preview_file, ".tmp")
-    try:
-        dirname = os.path.dirname(preview_file)
-        if dirname:
-            os.makedirs(dirname, exist_ok=True)
-        img = Image.fromarray(frame_np)
-        fmt = Image.registered_extensions().get(os.path.splitext(preview_file)[1].lower())
-        if not fmt:
-            fmt = "PNG"
-        img.save(tmp_path, format=fmt)
-        os.replace(tmp_path, preview_file)
-        return True
-    except (OSError, ValueError):
-        return False
-    finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError:
-            pass
-
-
 # Iteration frames written by single-image --frames/--timelapse runs.
 _STALE_FRAME_RE = re.compile(r"^o\d+_i\d+\.png$", re.IGNORECASE)
 
@@ -946,294 +530,114 @@ def clear_stale_frames(frames_dir: str | os.PathLike | None, allow_delete: bool 
             ) from exc
 
 
-def resize(t, size):
-    return F.interpolate(t, size=size, mode="bilinear", align_corners=False, antialias=True)
-
-
 def gradient_ascent(
-    model,
-    model_key,
-    img,
-    targets,
-    lr,
-    jitter,
-    guide_features=None,
-    target_class=None,
-):
-    if not targets and target_class is None:
-        raise SystemExit("Error: No layer targets or class target specified.")
-    sx = sy = 0
-    if jitter:
-        sx, sy = random.randint(-jitter, jitter), random.randint(-jitter, jitter)
-        img = torch.roll(img, shifts=(sx, sy), dims=(2, 3))
-
-    img = img.detach().clone().requires_grad_(True)
-    loss = torch.tensor(0.0, device=img.device)
-
-    if targets and target_class is not None:
-        # Single full forward: the classifier runs while hooks capture the
-        # target activations, so the trunk isn't forwarded twice when layer
-        # targets and a class target are combined.
-        acts, logits = forward_with_activations(model, img, targets)
-        layer_loss = _activation_loss(acts, guide_features)
-        class_loss = logits[0, target_class]
-        # The activation sum (~10^5 elements) dwarfs a single class logit by
-        # ~10^3x; normalize each gradient to unit mean-absolute magnitude so
-        # both terms steer equally. Costs one extra backward, not a second forward.
-        grad_layer = torch.autograd.grad(layer_loss, img, retain_graph=True)[0]
-        grad_class = torch.autograd.grad(class_loss, img)[0]
-        grad = grad_layer / (grad_layer.abs().mean() + 1e-8) + grad_class / (
-            grad_class.abs().mean() + 1e-8
-        )
-        loss = loss + layer_loss.detach() + class_loss.detach()
-    elif targets:
-        acts = run_to_layers(model, model_key, img, targets)
-        loss = loss + _activation_loss(acts, guide_features)
-        loss.backward()
-        grad = img.grad
-    elif target_class is not None:
-        logits = model(img)
-        loss = loss + logits[0, target_class]
-        loss.backward()
-        grad = img.grad
-
-    with torch.no_grad():
-        if grad is None:
-            raise RuntimeError(
-                "Gradient was None during ascent: the computational "
-                "graph is disconnected (no path from loss to input)."
-            )
-        if not bool(torch.isfinite(grad).all()):
-            raise RuntimeError("Gradient was NaN/Inf during ascent: try a lower --lr.")
-        grad = grad / (grad.abs().mean() + 1e-8)
-        img = img + lr * grad
-        for c in range(3):
-            img[:, c] = img[:, c].clamp(-MEAN[c] / STD[c], (1 - MEAN[c]) / STD[c])
-        img = img.detach()
-        if jitter:
-            img = torch.roll(img, shifts=(-sx, -sy), dims=(2, 3))
-    return img, float(loss.detach())
-
-
-def auto_octave_count(min_dim, octave_scale, target_base_size=TARGET_BASE_SIZE):
-    """Octaves auto mode asks for, before the MAX_OCTAVES cap is applied."""
-    if not math.isfinite(octave_scale) or octave_scale <= 1.0:
-        raise ValueError(f"octave_scale must be > 1.0, got {octave_scale}")
-    if min_dim > target_base_size:
-        return max(1, round(math.log(min_dim / target_base_size, octave_scale)) + 1)
-    return 1
-
-
-def plan_octaves(
-    h,
-    w,
-    num_octaves,
-    octave_scale,
-    min_octave_size=MIN_OCTAVE_SIZE,
-    target_base_size=TARGET_BASE_SIZE,
-):
-    """Number of octaves deepdream() will actually run for an hxw image."""
-    if not math.isfinite(octave_scale) or octave_scale <= 1.0:
-        raise ValueError(f"octave_scale must be > 1.0, got {octave_scale}")
-    if num_octaves == 0:
-        num_octaves = auto_octave_count(min(h, w), octave_scale, target_base_size)
-    num_octaves = min(num_octaves, MAX_OCTAVES)
-    count = 1
-    hh, ww = h, w
-    for _ in range(num_octaves - 1):
-        hh = round(hh / octave_scale)
-        ww = round(ww / octave_scale)
-        if min(hh, ww) < min_octave_size:
-            break
-        count += 1
-    return count
-
-
-def octave_truncation_note(requested, actual, octave_scale, auto_capped=False):
-    """Why fewer octaves than requested will run, or None if all will run."""
-    if auto_capped:
-        if actual < MAX_OCTAVES:
-            return (
-                f"auto octaves would exceed the {MAX_OCTAVES}-octave cap and the image "
-                f"can't fit {MAX_OCTAVES} octaves at octave-scale {octave_scale}; "
-                f"running {actual} instead."
-            )
-        return (
-            f"auto octaves capped at {MAX_OCTAVES}: octave-scale {octave_scale} is "
-            f"so close to 1.0 that reaching the ~{TARGET_BASE_SIZE}px base octave "
-            f"would take more than {MAX_OCTAVES} levels; running {actual} instead."
-        )
-    if requested <= 0 or actual >= requested:
-        return None
-    cap_bound = requested > MAX_OCTAVES
-    size_bound = actual < min(requested, MAX_OCTAVES)
-    if cap_bound and size_bound:
-        return (
-            f"--octaves {requested} exceeds the {MAX_OCTAVES}-octave cap and the "
-            f"image can't fit {MAX_OCTAVES} octaves at octave-scale {octave_scale}; "
-            f"running {actual} instead."
-        )
-    if cap_bound:
-        return f"--octaves {requested} capped at {MAX_OCTAVES} octaves; running {actual} instead."
-    return (
-        f"image too small for {requested} octaves at octave-scale {octave_scale}; "
-        f"running {actual} instead."
+    model: torch.nn.Module,
+    model_key: str,
+    img: torch.Tensor,
+    targets: Collection[str],
+    lr: float,
+    jitter: int,
+    guide_features: GuideFeatures | None = None,
+    target_class: int | None = None,
+) -> tuple[torch.Tensor, float]:
+    """Compatibility adapter around the numerical engine's ascent step."""
+    return dream_engine.gradient_ascent(
+        model,
+        model_key,
+        img,
+        targets,
+        lr,
+        jitter,
+        guide_features=guide_features,
+        target_class=target_class,
+        layer_capture=run_to_layers,
+        full_capture=forward_with_activations,
     )
-
-
-def validate_input_size(h, w, model_key, what="Input image", hint=None):
-    """Reject an input too small for the model's trunk to run without collapsing."""
-    if model_key not in MODEL_REGISTRY:
-        raise SystemExit(f"Unknown model '{model_key}'. Valid models: {sorted(MODEL_REGISTRY)}")
-    need = MODEL_REGISTRY[model_key]["min_size"]
-    if need and min(h, w) < need:
-        msg = (
-            f"Error: {what} is too small ({w}x{h}); model '{model_key}' "
-            f"needs at least {need}px on the short edge."
-        )
-        if hint:
-            msg += f" {hint}"
-        raise SystemExit(msg)
 
 
 def deepdream(
-    model,
-    model_key,
-    img,
-    targets,
-    iterations,
-    lr,
-    octave_scale,
-    num_octaves,
-    jitter,
-    device,
-    frames_dir=None,
-    guide_features=None,
-    target_class=None,
-    preview_file=None,
+    model: torch.nn.Module | None,
+    model_key: str,
+    img: torch.Tensor,
+    targets: Collection[str],
+    iterations: int,
+    lr: float,
+    octave_scale: float,
+    num_octaves: int,
+    jitter: int,
+    device: Device,
+    frames_dir: str | os.PathLike[str] | None = None,
+    guide_features: GuideFeatures | None = None,
+    target_class: int | None = None,
+    preview_file: str | os.PathLike[str] | None = None,
     clear_frames: bool = False,
-):
-    if not targets and target_class is None:
-        raise SystemExit("Error: No layer targets or class target specified.")
-    if not math.isfinite(octave_scale):
-        raise SystemExit(f"Error: octave_scale must be finite, got {octave_scale}")
-    if octave_scale <= 1.0:
-        raise SystemExit(f"Error: octave_scale must be > 1.0, got {octave_scale}")
-    if num_octaves < 0:
-        raise SystemExit(f"Error: num_octaves must be >= 0, got {num_octaves}")
-    if iterations < 0:
-        raise SystemExit(f"Error: iterations must be >= 0, got {iterations}")
-    if not math.isfinite(lr):
-        raise SystemExit(f"Error: lr must be finite, got {lr}")
-    if lr <= 0:
-        raise SystemExit(f"Error: lr must be > 0, got {lr}")
-    if jitter < 0:
-        raise SystemExit(f"Error: jitter must be >= 0, got {jitter}")
+) -> torch.Tensor:
+    """Attach CLI logging, structured progress, and media output to the engine."""
 
-    validate_input_size(img.shape[2], img.shape[3], model_key)
+    def start() -> None:
+        # The engine invokes this only after all numerical/input validation.
+        if frames_dir and iterations > 0:
+            clear_stale_frames(frames_dir, allow_delete=clear_frames)
+        elif frames_dir:
+            print("Note: --iterations is 0, so no frames will be written or changed.", flush=True)
 
-    if frames_dir and iterations > 0:
-        clear_stale_frames(frames_dir, allow_delete=clear_frames)
-    elif frames_dir:
+    def note(message: str) -> None:
+        print(f"Note: {message}", flush=True)
+
+    def octave(current: int, total: int, current_img: torch.Tensor) -> None:
         print(
-            "Note: --iterations is 0, so no frames will be written or changed.",
+            f"Octave {current}/{total}  image {current_img.shape[3]}x{current_img.shape[2]}",
             flush=True,
         )
+        emit_event(EV_OCTAVE, current=current, total=total)
 
-    # No full-image .to(device) here: the pyramid below is built and kept on
-    # CPU, and only one octave at a time moves to the device in the loop.
+    def iteration(
+        oi: int, current: int, total: int, current_img: torch.Tensor, loss: float
+    ) -> None:
+        print(f"  iteration {current}/{total}   loss {loss:9.1f}", flush=True)
+        emit_event(EV_ITERATION, current=current, total=total)
+        if frames_dir:
+            save_image(current_img, os.path.join(frames_dir, f"o{oi}_i{current}.png"))
 
-    requested_octaves = num_octaves
-    model_min = MODEL_REGISTRY.get(model_key, {}).get("min_size", MIN_OCTAVE_SIZE)
-    effective_min_octave = max(MIN_OCTAVE_SIZE, model_min)
-    effective_target_base = max(TARGET_BASE_SIZE, model_min)
-
-    num_octaves = plan_octaves(
-        img.shape[2],
-        img.shape[3],
-        num_octaves,
-        octave_scale,
-        min_octave_size=effective_min_octave,
-        target_base_size=effective_target_base,
-    )
-    auto_capped = (
-        requested_octaves == 0
-        and auto_octave_count(
-            min(img.shape[2], img.shape[3]),
-            octave_scale,
-            target_base_size=effective_target_base,
-        )
-        > MAX_OCTAVES
-    )
-
-    # Pyramid lives on CPU; only one octave moves to `device` at a time,
-    # keeping peak VRAM at ~3x the current level rather than the full pyramid.
-    base_cpu = img.detach().to("cpu")
-    octaves_cpu = [base_cpu]
-    for _ in range(num_octaves - 1):
-        cur = octaves_cpu[-1]
-        h_scaled = round(cur.shape[2] / octave_scale)
-        w_scaled = round(cur.shape[3] / octave_scale)
-        if min(h_scaled, w_scaled) < effective_min_octave:
-            break
-        octaves_cpu.append(resize(cur, [h_scaled, w_scaled]))
-    octaves_cpu.reverse()
-    note = octave_truncation_note(
-        requested_octaves, len(octaves_cpu), octave_scale, auto_capped=auto_capped
-    )
-    if note:
-        print(f"Note: {note}", flush=True)
-
-    detail_cpu = torch.zeros_like(octaves_cpu[0])
-    img_w = None
-    for oi, octave_cpu in enumerate(octaves_cpu):
-        if detail_cpu.shape[2:] != octave_cpu.shape[2:]:
-            detail_cpu = resize(detail_cpu, [octave_cpu.shape[2], octave_cpu.shape[3]])
-        octave = octave_cpu.to(device)
-        detail_d = detail_cpu.to(device)
-        img_w = (octave + detail_d).detach()
-        del detail_d
-        print(
-            f"Octave {oi + 1}/{len(octaves_cpu)}  image {img_w.shape[3]}x{img_w.shape[2]}",
-            flush=True,
-        )
-        emit_event(EV_OCTAVE, current=oi + 1, total=len(octaves_cpu))
-        for it in range(iterations):
-            img_w, loss = gradient_ascent(
-                model,
-                model_key,
-                img_w,
-                targets,
-                lr,
-                jitter,
-                guide_features=guide_features,
-                target_class=target_class,
-            )
-            print(
-                f"  iteration {it + 1}/{iterations}   loss {loss:9.1f}",
-                flush=True,
-            )
-            emit_event(EV_ITERATION, current=it + 1, total=iterations)
-            if frames_dir:
-                save_image(img_w, os.path.join(frames_dir, f"o{oi + 1}_i{it + 1}.png"))
-
-        detail_cpu = (img_w - octave).detach().to("cpu")
-        del octave
+    def octave_end(current_img: torch.Tensor) -> None:
         if preview_file:
             try:
-                if save_preview_frame(tensor_to_np(img_w), preview_file):
+                if save_preview_frame(tensor_to_np(current_img), preview_file):
                     print(f"[PREVIEW] {preview_file}", flush=True)
-                    emit_event(EV_PREVIEW, path=preview_file)
+                    emit_event(EV_PREVIEW, path=os.fspath(preview_file))
             except (OSError, ValueError):
                 pass
-        if oi < len(octaves_cpu) - 1:
-            # Free before allocating the next (larger) octave; detail carries forward on CPU.
-            del img_w
-            img_w = None
 
-    if img_w is None:
-        img_w = base_cpu.to(device)
-    return img_w
+    def step(current_img: torch.Tensor) -> tuple[torch.Tensor, float]:
+        return gradient_ascent(
+            cast(torch.nn.Module, model),
+            model_key,
+            current_img,
+            targets,
+            lr,
+            jitter,
+            guide_features=guide_features,
+            target_class=target_class,
+        )
+
+    return dream_engine.deepdream(
+        model,
+        model_key,
+        img,
+        targets,
+        iterations,
+        lr,
+        octave_scale,
+        num_octaves,
+        jitter,
+        device,
+        guide_features=guide_features,
+        target_class=target_class,
+        callbacks=DreamCallbacks(
+            start=start, note=note, octave=octave, iteration=iteration, octave_end=octave_end
+        ),
+        step=step,
+    )
 
 
 def resolve_video_quality(video_quality="balanced", crf=None, preset=None):
@@ -2679,7 +2083,8 @@ def _build_image_plan(
                     extra_suffix=f".p{os.getpid()}.tmp",
                 )
             else:
-                model_min = MODEL_REGISTRY.get(model_key, {}).get("min_size", MIN_OCTAVE_SIZE)
+                model_spec = MODEL_REGISTRY.get(model_key)
+                model_min = model_spec["min_size"] if model_spec is not None else MIN_OCTAVE_SIZE
                 n_octaves = plan_octaves(
                     target_h,
                     target_w,

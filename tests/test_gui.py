@@ -1979,6 +1979,60 @@ class TestVideoExport(unittest.TestCase):
             self.assertEqual(cmd[cmd.index("--fps") + 1], "24.00")
             self.assertNotIn("--encode-audio-from", cmd)
 
+    def test_export_completion_keeps_started_quality_when_controls_change(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._ready_job(d)
+            for started_crf, later_crf in ((17, 28), (0, 17)):
+                with self.subTest(started_crf=started_crf):
+                    self.app._video_crf.set(started_crf)
+                    out_mp4 = os.path.join(d, f"export-{started_crf}.mp4")
+                    cmd = self._save_video_command(out_mp4)
+                    self.assertEqual(cmd[cmd.index("--crf") + 1], str(started_crf))
+                    self.app._video_crf.set(later_crf)
+                    Path(out_mp4).write_bytes(b"completed export")
+                    with mock.patch.object(self.app, "_setup_mp4_preview", return_value=False):
+                        self.app._finish_video_encode(0, "", out_mp4, 1)
+                    self.assertEqual(self.app._video_last_crf, started_crf)
+                    self.assertIn(f"CRF {started_crf}", self.app._video_frames_label.cget("text"))
+                    self.assertIsNone(self.app._video_export_request)
+
+    def test_export_start_failure_clears_snapshot_and_keeps_frames(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._ready_job(d)
+            with (
+                mock.patch("tkinter.filedialog.asksaveasfilename", return_value=f"{d}/failed.mp4"),
+                mock.patch.object(self.app, "_start_encode_process", side_effect=OSError("failed")),
+                mock.patch.object(gui.messagebox, "showerror"),
+            ):
+                self.app._on_save_video_click()
+            self.assertIsNone(self.app._video_export_request)
+            self.assertFalse(self.app._video_save_in_progress)
+            self.assertIsNone(self.app._encode_proc)
+            self.assertTrue(self.app._has_ready_video_frames())
+
+    def test_stopped_export_completion_clears_snapshot_and_keeps_frames(self):
+        with tempfile.TemporaryDirectory() as d:
+            _job, frames_dir = self._ready_job(d)
+            existing_frames = set(Path(frames_dir).iterdir())
+            out_mp4 = os.path.join(d, "stopped.mp4")
+            self._save_video_command(out_mp4)
+            proc = self.app._encode_proc
+            proc.poll.return_value = None
+            with mock.patch.object(gui, "terminate_process") as terminate:
+                self.app._stop()
+            terminate.assert_called_once_with(proc)
+            # Completion remains owned by the queue, not the Stop handler.
+            self.assertIs(self.app._encode_proc, proc)
+            self.assertIsNotNone(self.app._video_export_request)
+            self.app._encode_queue.put(("done", 1, "cancelled", out_mp4, 1))
+            with mock.patch.object(gui.messagebox, "showerror"):
+                self.app._drain_encode_queue()
+            self.assertIsNone(self.app._video_export_request)
+            self.assertIsNone(self.app._encode_proc)
+            self.assertFalse(self.app._video_save_in_progress)
+            self.assertEqual(set(Path(frames_dir).iterdir()), existing_frames)
+            self.assertTrue(self.app._has_ready_video_frames())
+
     def test_save_click_includes_audio_for_video_mode(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "clip.mp4")
@@ -2004,6 +2058,7 @@ class TestVideoExport(unittest.TestCase):
             ):
                 self.app._on_save_video_click()
                 mrun.assert_not_called()
+                self.assertIsNone(self.app._video_export_request)
 
     def test_finish_save_marks_output_and_stays_savable(self):
         with tempfile.TemporaryDirectory() as d:

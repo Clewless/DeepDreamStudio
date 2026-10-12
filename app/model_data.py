@@ -172,6 +172,37 @@ MODEL_DEFAULTS = {
     },
 }
 
+# Ordered model keys, and the model a fresh session starts with.
+MODEL_KEYS = list(MODEL_ORDER)
+DEFAULT_MODEL_KEY = "vgg16"
+
+# Assembled per-model metadata for presentation layers (labels, layer lists,
+# recommended defaults). Lives here so the torch-free GUI modules share one
+# definition without importing app.gui.
+MODEL_META: dict[str, dict[str, Any]] = {
+    key: {
+        "label": MODEL_LABELS[key],
+        "description": MODEL_GUI_DESCRIPTIONS[key],
+        "layers": list(MODEL_LAYERS[key]),
+        "recommended": dict(MODEL_LAYERS[key])[MODEL_RECOMMENDED[key]],
+        "defaults": dict(MODEL_DEFAULTS[key]),
+    }
+    for key in MODEL_ORDER
+}
+
+MODEL_BY_LABEL = {MODEL_META[k]["label"]: k for k in MODEL_KEYS}
+DEFAULT_MODEL_LABEL = MODEL_META[DEFAULT_MODEL_KEY]["label"]
+
+
+def layer_display_list(model_key):
+    """Return the list of display labels for layers in the given model."""
+    return [label for _, label in MODEL_META[model_key]["layers"]]
+
+
+def layer_value_map(model_key):
+    """Return a {display_label: layer_key} dict for the given model."""
+    return {label: key for key, label in MODEL_META[model_key]["layers"]}
+
 
 # H.264 CRF and encoder speed preset per quality name.
 class VideoQualityPreset(TypedDict):

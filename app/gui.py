@@ -25,7 +25,7 @@ import imageio.v3 as iio
 from PIL import Image, ImageOps
 
 from . import __version__
-from .gui_export import VideoExportRequest, suggest_video_name
+from .gui_classifier import TargetClassPanelMixin
 
 try:
     import tkinterdnd2
@@ -43,7 +43,6 @@ from .gui_helpers import (
     PROC_DONE_PREFIX,
     ROOT,
     FrameCache,
-    VideoFrameLoader,
     _dialog_pattern_for_ext,
     build_reveal_command,
     clamp01,
@@ -53,7 +52,6 @@ from .gui_helpers import (
     draw_zoom_focus_marker,
     extract_output_path,
     fit_zoom_for,
-    format_frame_label,
     list_saved_video_frames,
     newest_media,
     newest_png,
@@ -61,16 +59,15 @@ from .gui_helpers import (
     render_zoomed_preview,
     resolve_out_dir,
     terminate_process,
-    timeline_index_to_t,
-    timeline_t_to_index,
 )
 from .gui_job import (
-    _CRF_TO_QUALITY,
-    VIDEO_QUALITY_INFO,
     GenerationJob,
     ProgressTracker,
 )
-from .gui_process import read_encode_output, read_generation_output, start_cli_process
+from .gui_layers import LayerPanelMixin
+from .gui_playback import VideoPlaybackMixin
+from .gui_process import read_generation_output, start_cli_process
+from .gui_video import VideoExportMixin
 from .gui_viewer import ViewerGeometry
 from .gui_widgets import (
     ACCENT,
@@ -96,126 +93,33 @@ from .gui_widgets import (
     ModernOptionMenu,
     ModernProgressBar,
     ModernScrollableFrame,
-    ModernScrollbar,
     ModernSegmentedButton,
-    ModernSlider,
     ModernTextbox,
     Tooltip,
     _apply_modern_style,
     _SliderRow,
-    resolve_font_family,
 )
-from .imagenet_categories import lookup_category, search_categories
+from .imagenet_categories import lookup_category
 from .model_data import (
+    DEFAULT_MODEL_KEY,
+    DEFAULT_MODEL_LABEL,
     MAX_NAME_LEN,
-    MODEL_DEFAULTS,
-    MODEL_GUI_DESCRIPTIONS,
-    MODEL_LAYERS,
-    MODEL_ORDER,
-    MODEL_RECOMMENDED,
+    MODEL_BY_LABEL,
+    MODEL_KEYS,
+    MODEL_META,
     VIDEO_EXTENSIONS,
     filename_stem_error,
+    layer_display_list,
+    layer_value_map,
     read_video_frames_meta,
-)
-from .model_data import (
-    MODEL_LABELS as MODEL_LABELS_MAP,
 )
 from .protocol import EV_DONE, EV_PREVIEW, parse_event
 
 __all__ = ["DeepDreamGUI", "main"]
 
-# deepdream.py runs as a subprocess, so model metadata comes from the
-# torch-free model_data module instead of importing it here.
-
-MODEL_META: dict[str, dict[str, Any]] = {
-    key: {
-        "label": MODEL_LABELS_MAP[key],
-        "description": MODEL_GUI_DESCRIPTIONS[key],
-        "layers": list(MODEL_LAYERS[key]),
-        "recommended": dict(MODEL_LAYERS[key])[MODEL_RECOMMENDED[key]],
-        "defaults": dict(MODEL_DEFAULTS[key]),
-    }
-    for key in MODEL_ORDER
-}
-
-# Categorized layer depth tiers for visual layer selection
-LAYER_TIERS = {
-    "googlenet": [
-        (
-            "Shallow Textures",
-            "Fine textures, lines & ripples",
-            ["inception3a", "inception3b"],
-        ),
-        (
-            "Shapes & Objects",
-            "Eyes, faces, dogs & organic shapes",
-            ["inception4a", "inception4b", "inception4c", "inception4d", "inception4e"],
-        ),
-        (
-            "Deep Abstraction",
-            "Large structures & heavy hallucination",
-            ["inception5a", "inception5b"],
-        ),
-    ],
-    "inceptionv3": [
-        (
-            "Shallow Textures",
-            "Fine patterns & soft textures",
-            ["Mixed_5b", "Mixed_5c", "Mixed_5d"],
-        ),
-        (
-            "Shapes & Objects",
-            "Objects and shapes forming",
-            ["Mixed_6a", "Mixed_6b", "Mixed_6c", "Mixed_6d", "Mixed_6e"],
-        ),
-        (
-            "Deep Abstraction",
-            "Bold, complex objects & structures",
-            ["Mixed_7a", "Mixed_7b", "Mixed_7c"],
-        ),
-    ],
-    "vgg16": [
-        (
-            "Shallow Textures",
-            "Fine textures & brush patterns",
-            ["features.3", "features.8"],
-        ),
-        (
-            "Shapes & Objects",
-            "Bold shapes & emerging objects",
-            ["features.15", "features.22"],
-        ),
-        ("Deep Abstraction", "Abstract forms & heavy hallucination", ["features.29"]),
-    ],
-    "vgg19": [
-        (
-            "Shallow Textures",
-            "Micro-textures & ripples",
-            ["features.3", "features.8"],
-        ),
-        (
-            "Shapes & Objects",
-            "Geometric patterns & objects forming",
-            ["features.17", "features.26"],
-        ),
-        ("Deep Abstraction", "Deep structures & abstraction", ["features.35"]),
-    ],
-}
-
-RECOMMENDED_MULTI_LAYERS = {
-    "googlenet": ["inception4c", "inception5b"],
-    "inceptionv3": ["Mixed_6d", "Mixed_7b"],
-    "vgg16": ["features.15", "features.22"],
-    "vgg19": ["features.26", "features.35"],
-}
-
-# Ordered model keys for the dropdown.
-MODEL_KEYS = list(MODEL_ORDER)
+# Ordered model display labels for the model dropdown.
 MODEL_LABELS = [MODEL_META[k]["label"] for k in MODEL_KEYS]
-MODEL_BY_LABEL = {MODEL_META[k]["label"]: k for k in MODEL_KEYS}
 
-DEFAULT_MODEL_KEY = "vgg16"
-DEFAULT_MODEL_LABEL = MODEL_META[DEFAULT_MODEL_KEY]["label"]
 
 PRESETS: dict[str, dict[str, Any] | None] = {
     "Select a preset...": None,
@@ -377,20 +281,12 @@ def presets_for_model(model_key):
     ]
 
 
-def _layer_display_list(model_key):
-    """Return the list of display labels for layers in the given model."""
-    return [label for _, label in MODEL_META[model_key]["layers"]]
-
-
-def _layer_value_map(model_key):
-    """Return a {display_label: layer_key} dict for the given model."""
-    return {label: key for key, label in MODEL_META[model_key]["layers"]}
-
-
 # Main window
 
 
-class DeepDreamGUI(tk.Tk):
+class DeepDreamGUI(
+    TargetClassPanelMixin, LayerPanelMixin, VideoExportMixin, VideoPlaybackMixin, tk.Tk
+):
     def __init__(self, initial_image=None):
         super().__init__()
 
@@ -398,30 +294,12 @@ class DeepDreamGUI(tk.Tk):
         self._zoom_focus_label: Any = None
         self._status_label: Any = None
         self._preset_menu: Any = None
-        self._video_quality_seg: Any = None
-        self._video_quality_info_lbl: Any = None
-        self._video_quality_frame: Any = None
-        self._class_selected_label: Any = None
-        self._class_dropdown: Any = None
-        self._class_listbox: Any = None
-        self._layer_chips_container: Any = None
-        self._layer_mode_seg: Any = None
-        self._single_layer_frame: Any = None
-        self._multi_layer_frame: Any = None
-        self._layer_badge_count: Any = None
         self._main_resume_btn: Any = None
-        self._save_video_btn: Any = None
-        self._sidebar_save_video_btn: Any = None
         self._zoom_bar: Any = None
         self._zoom_label: Any = None
-        self._video_bar: Any = None
-        self._video_pos_label: Any = None
-        self._video_slider: Any = None
-        self._video_play_btn: Any = None
         self._compare_seg: Any = None
         self._queue_scroll: Any = None
         self._queue_inner: Any = None
-        self._video_frames_label: Any = None
 
         self.title(f"DeepDream Studio {__version__}")
         self.geometry("1180x780")
@@ -453,16 +331,10 @@ class DeepDreamGUI(tk.Tk):
         # Guidance
         self._guidance_mode_var = tk.StringVar(value="Unguided")
         self._guide_path = tk.StringVar(value="")
-        self._target_class_var = tk.StringVar(value="")
-        self._target_class_var.trace_add("write", self._on_target_class_var_changed)
-        self._class_search_var = tk.StringVar(value="")
-        self._class_search_var.trace_add("write", self._on_class_search_changed)
-        self._class_filter_name = "Popular"
+        self._init_target_class_state()
 
         # Multi-layer
-        self._layer_mode_var = tk.StringVar(value="Single Layer")
-        self._custom_layers_var = tk.StringVar(value="")
-        self._custom_layers_var.trace_add("write", self._on_custom_layers_var_changed)
+        self._init_layer_state()
 
         # Video & animation options
         self._timelapse = tk.BooleanVar(value=False)
@@ -473,8 +345,7 @@ class DeepDreamGUI(tk.Tk):
         self._zoom_cx = tk.DoubleVar(value=0.5)
         self._zoom_cy = tk.DoubleVar(value=0.5)
         self._video_blend = tk.DoubleVar(value=0.5)
-        self._video_quality_var = tk.StringVar(value="Balanced")
-        self._video_crf = tk.IntVar(value=17)
+        self._init_video_export_state()
 
         # Before / After comparison state
         self._input_pil = None
@@ -502,44 +373,16 @@ class DeepDreamGUI(tk.Tk):
         self._viewer_cx = None
         self._viewer_cy = None
         self._viewer_drag = None  # (start_x, start_y, cx0, cy0, moved)
-        self._video_kind = None  # None | "frames" | "mp4"
-        self._video_paths: list[str] = []
-        self._video_mp4: str | None = None
-        self._video_index = 0
-        self._video_total = 0
-        self._video_fps = 30.0
-        self._video_playing = False
-        self._video_after_id = None
-        self._video_slider_sync = False
-        self._video_cache: FrameCache = FrameCache()
-        # Decodes and frame counts run on a worker thread so a long mp4 cannot
-        # freeze the window; results are applied by _poll_video_loader.
-        self._video_loader: VideoFrameLoader | None = None
-        self._video_poll_after_id = None
-        self._video_requested_index = 0
-        self._video_probe_token = 0
-        self._video_pending_title = None
-
-        def _on_video_result(result):
-            if result and result[0] == "frame":
-                self._on_video_frame_result(*result[1:])
-            elif result and result[0] == "probe":
-                self._on_video_probe_result(*result[1:])
-
-        self._video_loader = VideoFrameLoader(_on_video_result)
+        self._init_video_playback_state()
         self._timelapse_mp4: str | None = None
         self._viewer_mode = "image"  # "image" | "video" | "timelapse"
 
         self._is_closing = False
         self._reported_callback_errors: set = set()
         self._proc = None
-        self._encode_proc = None
         self._poll_after_id = None
         self._next_job_after_id = None
         self._log_queue: queue.Queue[str] = queue.Queue()
-        # Encode-subprocess events (log lines and completion) as tuples, drained
-        # on the Tk thread by _poll_log so workers never touch Tk.
-        self._encode_queue: queue.Queue[tuple] = queue.Queue()
         self._output_path = None  # last successfully saved image
         self._preview_pil = None  # PIL image for the input preview
         self._tracker = ProgressTracker()
@@ -548,17 +391,6 @@ class DeepDreamGUI(tk.Tk):
         self._aborted_jobs: set[int] = set()
         self._frames_dir = None  # frames/ dir for the current run
         self._frames_preexisting = False
-        # Separated video-save state: the most recent dreamed frame sequence
-        # awaiting export. It stays re-exportable until its frames are removed.
-        self._video_frames_dir = None
-        self._video_frames_count = 0
-        self._video_frames_fps = 30.0
-        self._video_frames_mode = None
-        self._video_frames_source = None
-        self._video_frames_job_id = None
-        self._video_frames_job = None
-        self._video_save_in_progress = False
-        self._video_export_target = None
 
         # Generation Queue state
         self._job_queue = []
@@ -568,13 +400,7 @@ class DeepDreamGUI(tk.Tk):
         self._resumable_job = None
 
         # Additional UI and viewer state
-        self._video_last_save = None
-        self._video_last_crf = None
         self._last_render_view_size = None
-        self._class_listbox_height = 8
-        self._class_listbox_min_height = 3
-        self._class_listbox_max_height = 20
-        self._class_list_resize_state = None
         # Load TkDND into this window's tcl interpreter BEFORE building the UI
         global _DND_AVAILABLE
         if _DND_AVAILABLE:
@@ -905,175 +731,7 @@ class DeepDreamGUI(tk.Tk):
         self._guide_path_label.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
         self._guide_frame.grid_remove()  # Hidden initially
 
-        # Target Class container
-        self._class_frame = ModernFrame(sb, fg_color=BG_CARD)
-        self._class_frame.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 8))
-        self._class_frame.grid_columnconfigure(0, weight=1)
-
-        # Active Target Class Badge / Status
-        self._class_status_card = ModernFrame(self._class_frame, fg_color=BG_PANEL)
-        self._class_status_card.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 4))
-        self._class_status_card.grid_columnconfigure(0, weight=1)
-
-        self._class_selected_label = ModernLabel(
-            self._class_status_card,
-            text="No target selected (search or click below)",
-            font=ModernFont(family="Segoe UI", size=10, weight="bold"),
-            text_color=TEXT_LABEL,
-            anchor="w",
-        )
-        self._class_selected_label.grid(row=0, column=0, sticky="w", padx=8, pady=4)
-
-        self._class_clear_btn = ModernButton(
-            self._class_status_card,
-            text="✕ Clear",
-            width=50,
-            height=22,
-            fg_color=BG_CARD,
-            hover_color=BORDER,
-            text_color=TEXT_DIM,
-            font=ModernFont(family="Segoe UI", size=9),
-            command=self._clear_target_class,
-        )
-        self._class_clear_btn.grid(row=0, column=1, padx=6, pady=4)
-        Tooltip(self._class_clear_btn, "Clear current target class.")
-
-        # Search Box with Clear Button
-        search_box_frame = ModernFrame(self._class_frame, fg_color="transparent")
-        search_box_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
-        search_box_frame.grid_columnconfigure(0, weight=1)
-
-        self._class_search_entry = ModernEntry(
-            search_box_frame,
-            textvariable=self._class_search_var,
-            placeholder_text="Search category or index (e.g. dog, 130)...",
-            fg_color=BG_PANEL,
-            border_color=BORDER,
-            text_color=TEXT_MAIN,
-            font=ModernFont(family="Segoe UI", size=10),
-            height=28,
-        )
-        self._class_search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self._class_search_entry.bind("<Return>", self._on_class_search_enter)
-        Tooltip(
-            self._class_search_entry,
-            "Type any category name or numeric index (0-999) to filter the dropdown in real time.",
-        )
-
-        clear_search_btn = ModernButton(
-            search_box_frame,
-            text="✕",
-            width=24,
-            height=28,
-            fg_color=BG_PANEL,
-            hover_color=BORDER,
-            text_color=TEXT_DIM,
-            font=ModernFont(family="Segoe UI", size=9, weight="bold"),
-            command=self._clear_class_search,
-        )
-        clear_search_btn.grid(row=0, column=1)
-        Tooltip(clear_search_btn, "Clear search text.")
-
-        # Mouse-only Quick Category Filters
-        self._class_filter_seg = ModernSegmentedButton(
-            self._class_frame,
-            values=["Popular", "Animals", "Food", "Vehicles", "All"],
-            command=self._on_class_category_filter_change,
-            selected_color=BORDER,
-            selected_hover_color=ACCENT,
-            font=ModernFont(family="Segoe UI", size=9),
-            height=24,
-        )
-        self._class_filter_seg.set("Popular")
-        self._class_filter_seg.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
-        Tooltip(
-            self._class_filter_seg, "Click to filter categories by theme with only mouse input."
-        )
-
-        # Initial popular choices for dropdown
-        initial_matches = search_categories("", category_filter="★ Popular")
-        init_values = [m[2] for m in initial_matches] or ["#130: flamingo"]
-
-        # Dropdown Menu
-        self._class_dropdown = ModernOptionMenu(
-            self._class_frame,
-            values=init_values,
-            command=self._on_class_dropdown_select,
-            fg_color=BG_PANEL,
-            button_color=ACCENT,
-            button_hover_color=ACCENT_HOVER,
-            dropdown_fg_color=BG_CARD,
-            dropdown_hover_color=BORDER,
-            font=ModernFont(family="Segoe UI", size=11),
-            text_color=TEXT_MAIN,
-            height=30,
-        )
-        self._class_dropdown.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 4))
-        Tooltip(
-            self._class_dropdown,
-            "Dropdown menu: click with mouse to browse and select ImageNet categories.",
-        )
-
-        # Integrated Dropdown Listbox (scrollable with mouse wheel, 1-click select)
-        # Height is 8 rows by default; the grip below resizes it (3-20 rows).
-        list_container = ModernFrame(self._class_frame, fg_color=BG_PANEL)
-        list_container.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 2))
-        list_container.grid_columnconfigure(0, weight=1)
-
-        self._class_listbox_height = 8
-        self._class_listbox_min_height = 3
-        self._class_listbox_max_height = 20
-        self._class_list_resize_state = None
-        self._class_listbox = tk.Listbox(
-            list_container,
-            bg=BG_PANEL,
-            fg=TEXT_MAIN,
-            selectbackground=ACCENT,
-            selectforeground=BG_DEEP,
-            activestyle="none",
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=0,
-            font=(resolve_font_family("Segoe UI"), 9),
-            height=self._class_listbox_height,
-        )
-        self._class_listbox.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=4)
-
-        lb_scroll = ModernScrollbar(list_container, command=self._class_listbox.yview, width=12)
-        lb_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 4), pady=4)
-        self._class_listbox.configure(yscrollcommand=lb_scroll.set)
-
-        self._class_listbox.bind("<<ListboxSelect>>", self._on_class_listbox_select)
-        self._class_listbox.bind("<ButtonRelease-1>", self._on_class_listbox_select)
-        Tooltip(
-            list_container,
-            "Scrollable category box: click any item with mouse to select as target.",
-        )
-
-        # Drag-to-resize grip for the listbox above
-        self._class_list_resize_grip = ModernLabel(
-            self._class_frame,
-            text="⋯  ⇕ drag to resize list  ⋯",
-            font=ModernFont(family="Segoe UI", size=8),
-            text_color=TEXT_DIM,
-            fg_color=BG_PANEL,
-            cursor="sb_v_double_arrow",
-            anchor="center",
-        )
-        self._class_list_resize_grip.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
-        Tooltip(
-            self._class_list_resize_grip,
-            "Click and drag up/down to resize the category list to fit your needs.",
-        )
-        self._class_list_resize_grip.bind("<Button-1>", self._on_class_list_resize_start)
-        self._class_list_resize_grip.bind("<B1-Motion>", self._on_class_list_resize_drag)
-        self._class_list_resize_grip.bind("<ButtonRelease-1>", self._on_class_list_resize_end)
-
-        # Populate initial listbox items
-        for v in init_values:
-            self._class_listbox.insert(tk.END, f"  {v}")
-
-        self._class_frame.grid_remove()  # Hidden initially
+        self._build_target_class_panel(sb)
 
     def _build_sidebar_model(self, sb):
         # Model selector
@@ -1115,141 +773,6 @@ class DeepDreamGUI(tk.Tk):
             wraplength=280,
         )
         self._model_desc_label.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
-
-    def _build_sidebar_layers(self, sb):
-        # Layer selector
-        self._section(sb, row=12, label="Dream Layer")
-        layer_card = ModernFrame(sb, fg_color=BG_CARD)
-        layer_card.grid(row=13, column=0, sticky="ew", padx=16, pady=(0, 8))
-        layer_card.grid_columnconfigure(0, weight=1)
-
-        # Mode toggle: Single Layer vs Multi-Layer
-        self._layer_mode_seg = ModernSegmentedButton(
-            layer_card,
-            values=["Single Layer", "Multi-Layer"],
-            variable=self._layer_mode_var,
-            selected_color=BORDER,
-            selected_hover_color=ACCENT,
-            font=ModernFont(family="Segoe UI", size=11),
-            command=self._on_layer_mode_change,
-        )
-        self._layer_mode_seg.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 6))
-        Tooltip(
-            self._layer_mode_seg,
-            "Layer mode:\n"
-            "• Single Layer: Focuses all dream iterations on one specific network depth.\n"
-            "• Multi-Layer: Combines and balances features across multiple layers at once.",
-        )
-
-        # Single Layer container
-        self._single_layer_frame = ModernFrame(layer_card, fg_color="transparent")
-        self._single_layer_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
-        self._single_layer_frame.grid_columnconfigure(0, weight=1)
-
-        self._layer_menu = ModernOptionMenu(
-            self._single_layer_frame,
-            variable=self._layer_var,
-            values=_layer_display_list(DEFAULT_MODEL_KEY),
-            command=self._on_single_layer_select,
-            fg_color=BG_PANEL,
-            button_color=ACCENT,
-            button_hover_color=ACCENT_HOVER,
-            dropdown_fg_color=BG_CARD,
-            dropdown_hover_color=BORDER,
-            font=ModernFont(family="Segoe UI", size=12),
-            text_color=TEXT_MAIN,
-            height=34,
-        )
-        self._layer_menu.grid(row=0, column=0, sticky="ew")
-        Tooltip(
-            self._layer_menu,
-            "Which layer to optimize:\n"
-            "• Early layers: Fine lines, ripples, textures.\n"
-            "• Middle layers: Geometric forms, eyes, shapes.\n"
-            "• Deep layers: Large high-level structures.",
-        )
-
-        # Multi-Layer container
-        self._multi_layer_frame = ModernFrame(layer_card, fg_color="transparent")
-        self._multi_layer_frame.grid_columnconfigure(0, weight=1)
-
-        ml_header = ModernFrame(self._multi_layer_frame, fg_color="transparent")
-        ml_header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        ml_header.grid_columnconfigure(0, weight=1)
-
-        self._layer_badge_count = ModernLabel(
-            ml_header,
-            text="Active (0)",
-            font=ModernFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=TEXT_LABEL,
-        )
-        self._layer_badge_count.grid(row=0, column=0, sticky="w")
-
-        ml_rec_btn = ModernButton(
-            ml_header,
-            text="★ Rec",
-            width=50,
-            height=24,
-            fg_color=BG_PANEL,
-            hover_color=BORDER,
-            text_color=TEXT_MAIN,
-            font=ModernFont(family="Segoe UI", size=10, weight="bold"),
-            command=self._select_recommended_layers,
-        )
-        ml_rec_btn.grid(row=0, column=1, padx=(0, 4))
-        Tooltip(ml_rec_btn, "Activate recommended layer combination for this model.")
-
-        ml_all_btn = ModernButton(
-            ml_header,
-            text="All",
-            width=36,
-            height=24,
-            fg_color=BG_PANEL,
-            hover_color=BORDER,
-            text_color=TEXT_MAIN,
-            font=ModernFont(family="Segoe UI", size=10),
-            command=self._select_all_layers,
-        )
-        ml_all_btn.grid(row=0, column=2, padx=(0, 4))
-        Tooltip(ml_all_btn, "Activate all available layers.")
-
-        ml_clear_btn = ModernButton(
-            ml_header,
-            text="Clear",
-            width=44,
-            height=24,
-            fg_color=BG_PANEL,
-            hover_color=BORDER,
-            text_color=TEXT_DIM,
-            font=ModernFont(family="Segoe UI", size=10),
-            command=self._clear_multi_layers,
-        )
-        ml_clear_btn.grid(row=0, column=3)
-        Tooltip(ml_clear_btn, "Deactivate all layers.")
-
-        # Interactive chips container
-        self._layer_chips_container = ModernFrame(
-            self._multi_layer_frame,
-            fg_color=BG_PANEL,
-        )
-        self._layer_chips_container.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-
-        # Direct text entry for custom layer names.
-        self._custom_layers_entry = ModernEntry(
-            self._multi_layer_frame,
-            textvariable=self._custom_layers_var,
-            placeholder_text="e.g. inception4c,inception5b",
-            fg_color=BG_PANEL,
-            border_color=BORDER,
-            text_color=TEXT_MAIN,
-            font=ModernFont(family="Segoe UI", size=10),
-            height=26,
-        )
-        self._custom_layers_entry.grid(row=2, column=0, sticky="ew", pady=(0, 4))
-        Tooltip(
-            self._custom_layers_entry,
-            "Direct layer input: comma-separated list of layer names. Auto-syncs with badges above.",
-        )
 
     def _build_sidebar_parameters(self, sb):
         # Parameters
@@ -1478,96 +1001,7 @@ class DeepDreamGUI(tk.Tk):
         )
         self._video_frame.grid_remove()
 
-        # Video Export parameters: quality preset + explicit Save Video.
-        # Generation only dreams the frame sequence; exporting the .mp4 is a
-        # separate user action so the same frames can be saved repeatedly at
-        # different quality levels without re-running the dream.
-        self._video_quality_frame = ModernFrame(sb, fg_color=BG_CARD)
-        self._video_quality_frame.grid(row=17, column=0, sticky="ew", padx=16, pady=(0, 8))
-        self._video_quality_frame.grid_columnconfigure(0, weight=1)
-        ModernLabel(
-            self._video_quality_frame,
-            text="Video Export",
-            font=ModernFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=TEXT_LABEL,
-            anchor="w",
-        ).grid(row=0, column=0, sticky="w", padx=12, pady=(8, 4))
-
-        self._video_quality_seg = ModernSegmentedButton(
-            self._video_quality_frame,
-            values=["Small", "Balanced", "Lossless"],
-            variable=self._video_quality_var,
-            selected_color=BORDER,
-            selected_hover_color=ACCENT,
-            font=ModernFont(family="Segoe UI", size=11),
-            command=self._on_video_quality_seg_change,
-        )
-        self._video_quality_seg.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 4))
-        Tooltip(
-            self._video_quality_seg,
-            "Video encoding preset:\n"
-            "• Small: Fast export, compact file (CRF 28).\n"
-            "• Balanced: High quality, crisp detail (CRF 17, default).\n"
-            "• Lossless: No compression loss (CRF 0).",
-        )
-
-        self._video_quality_info_lbl = ModernLabel(
-            self._video_quality_frame,
-            text=VIDEO_QUALITY_INFO["Balanced"]["desc"],
-            font=ModernFont(family="Segoe UI", size=10),
-            text_color=TEXT_LABEL,
-            anchor="w",
-            wraplength=220,
-            justify="left",
-        )
-        self._video_quality_info_lbl.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 4))
-
-        self._slider(
-            self._video_quality_frame,
-            3,
-            "CRF (Quality)",
-            self._video_crf,
-            0,
-            51,
-            True,
-            tip="H.264 video quality (0-51; lower = better). 0 = lossless (exact pixels), "
-            "17 = visually perfect (recommended), 28 = compact file for easy sharing.",
-            curve=1.0,
-            step=1,
-        )
-        self._video_crf.trace_add("write", self._on_video_crf_changed)
-
-        self._video_frames_label = ModernLabel(
-            self._video_quality_frame,
-            text="No video frames yet. Run a Zoom/Video generation first.",
-            font=ModernFont(family="Segoe UI", size=10),
-            text_color=TEXT_DIM,
-            anchor="w",
-            wraplength=260,
-            justify="left",
-        )
-        self._video_frames_label.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 4))
-
-        self._sidebar_save_video_btn = ModernButton(
-            self._video_quality_frame,
-            text="Save Video",
-            font=ModernFont(family="Segoe UI", size=11, weight="bold"),
-            fg_color=BORDER,
-            hover_color=ACCENT,
-            text_color=TEXT_MAIN,
-            height=30,
-            state="disabled",
-            command=self._on_save_video_click,
-        )
-        self._sidebar_save_video_btn.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 10))
-        Tooltip(
-            self._sidebar_save_video_btn,
-            "Export the current dreamed frame sequence to an .mp4 at the "
-            "quality selected above.\n"
-            "Repeat as often as you like (once Small for sharing, once "
-            "Lossless for archival) without re-running the dream.",
-        )
-        self._video_quality_frame.grid_remove()
+        self._build_video_export_controls(sb)
 
         # Output options
         self._section(sb, row=18, label="Output")
@@ -1690,7 +1124,7 @@ class DeepDreamGUI(tk.Tk):
         model_key = MODEL_BY_LABEL.get(label, DEFAULT_MODEL_KEY)
         meta = MODEL_META[model_key]
         self._model_desc_label.configure(text=meta["description"])
-        new_layers = _layer_display_list(model_key)
+        new_layers = layer_display_list(model_key)
         self._layer_menu.configure(values=new_layers)
         self._layer_var.set(meta["recommended"])
 
@@ -1917,97 +1351,6 @@ class DeepDreamGUI(tk.Tk):
         # row appears/disappears) so the image always fills the exact space.
         self._preview_label.bind("<Configure>", self._on_viewer_configure, add="+")
         self.bind("<space>", self._on_space_pressed)
-
-    def _build_main_video_bar(self, preview_card):
-        # Integrated video bar: timeline scrubber + play/pause
-        # Frame-sequence preview (no re-encode): dreamed PNGs are shown in
-        # order at their recorded fps. Scrubbing is instant and costs no
-        # extra encode; saving via Save Video still produces the final .mp4.
-        video_bar = ModernFrame(preview_card, fg_color=BG_PANEL, height=30)
-        video_bar.grid_columnconfigure(1, weight=1)
-        self._video_bar = video_bar
-        self._video_play_btn = ModernButton(
-            video_bar,
-            text="▶ Play",
-            font=ModernFont(family="Segoe UI", size=11, weight="bold"),
-            fg_color=BORDER,
-            hover_color=ACCENT,
-            text_color=TEXT_MAIN,
-            height=24,
-            width=68,
-            command=self._on_video_play_pause,
-        )
-        self._video_play_btn.grid(row=0, column=0, padx=(8, 4), pady=3)
-        Tooltip(self._video_play_btn, "Play / pause the preview (plays dreamed frames in order).")
-        self._video_slider = ModernSlider(
-            video_bar,
-            from_=0.0,
-            to=1.0,
-            command=self._on_video_slider_change,
-            height=12,
-        )
-        self._video_slider.set(0.0)
-        self._video_slider.grid(row=0, column=1, sticky="ew", padx=4, pady=3)
-        Tooltip(self._video_slider, "Scrub through dreamed frames.")
-        self._video_pos_label = ModernLabel(
-            video_bar,
-            text="No frames",
-            font=ModernFont(family="Consolas", size=10),
-            text_color=TEXT_DIM,
-            width=160,
-        )
-        self._video_pos_label.grid(row=0, column=2, padx=(4, 8), pady=3)
-        self._video_bar.grid(row=4, column=0, sticky="ew", padx=10, pady=(2, 2))
-        self._video_bar.grid_remove()
-
-        # Preview actions and output location.
-        open_row = ModernFrame(preview_card, fg_color="transparent")
-        open_row.grid(row=5, column=0, sticky="e", padx=10, pady=(2, 6))
-
-        self._view_image_btn = ModernButton(
-            open_row,
-            text="View Image",
-            fg_color=BG_PANEL,
-            hover_color=BORDER,
-            text_color=TEXT_MAIN,
-            font=ModernFont(family="Segoe UI", size=11),
-            height=28,
-            width=95,
-            command=self._on_view_image_toggle,
-        )
-        self._view_image_btn.grid(row=0, column=0, padx=(0, 6))
-        self._view_image_btn.grid_remove()
-        Tooltip(self._view_image_btn, "Switch the preview back to the still image.")
-
-        self._view_timelapse_btn = ModernButton(
-            open_row,
-            text="▶ Timelapse",
-            fg_color=BG_PANEL,
-            hover_color=BORDER,
-            text_color=TEXT_MAIN,
-            font=ModernFont(family="Segoe UI", size=11),
-            height=28,
-            width=95,
-            command=self._on_view_timelapse_toggle,
-        )
-        self._view_timelapse_btn.grid(row=0, column=1, padx=(0, 6))
-        self._view_timelapse_btn.grid_remove()
-        Tooltip(self._view_timelapse_btn, "Preview the timelapse video inside this window.")
-
-        self._open_dir_btn = ModernButton(
-            open_row,
-            text="Show in Folder",
-            fg_color=BG_PANEL,
-            hover_color=BORDER,
-            text_color=TEXT_MAIN,
-            font=ModernFont(family="Segoe UI", size=11),
-            height=28,
-            width=110,
-            command=self._show_in_folder,
-        )
-        self._open_dir_btn.grid(row=0, column=2)
-        self._open_dir_btn.grid_remove()
-        Tooltip(self._open_dir_btn, "Reveal the output file in File Explorer (highlighted).")
 
     def _build_main_actions(self, main):
         # Dream / Save Video / Queue / Stop buttons
@@ -2405,329 +1748,6 @@ class DeepDreamGUI(tk.Tk):
             pass
         self._zoom_focus_label_update()
 
-    def _on_video_quality_seg_change(self, value: str):
-        if value in VIDEO_QUALITY_INFO:
-            self._video_crf.set(VIDEO_QUALITY_INFO[value]["crf"])
-            self._video_quality_var.set(value)
-            if self._video_quality_info_lbl is not None:
-                self._video_quality_info_lbl.configure(text=VIDEO_QUALITY_INFO[value]["desc"])
-
-    def _get_current_crf(self):
-        try:
-            return int(self._video_crf.get())
-        except (ValueError, tk.TclError):
-            return 17
-
-    def _on_video_crf_changed(self, *args):
-        try:
-            crf = self._video_crf.get()
-        except (ValueError, tk.TclError):
-            return
-
-        name = _CRF_TO_QUALITY.get(crf)
-        if name is not None:
-            desc = VIDEO_QUALITY_INFO[name]["desc"]
-        else:
-            name = "Custom"
-            if crf < 17:
-                qual = "Near-Lossless / Ultra"
-            elif crf <= 28:
-                qual = "High / Balanced"
-            else:
-                qual = "Compressed / Small"
-            desc = f"Custom: {qual} (CRF {crf}, 0=lossless, 51=max compression)"
-
-        if self._video_quality_seg is not None:
-            self._video_quality_seg.set(name)
-        self._video_quality_var.set(name)
-        if self._video_quality_info_lbl is not None:
-            self._video_quality_info_lbl.configure(text=desc)
-
-    # Separated video export: generation dreams a frame sequence, and these
-    # methods encode it to .mp4 at the chosen quality without re-dreaming.
-
-    def _has_ready_video_frames(self):
-        d = self._video_frames_dir
-        try:
-            return bool(d and os.path.isdir(d) and count_saved_video_frames(d) > 0)
-        except OSError:
-            return False
-
-    def _refresh_video_save_ui(self):
-        btns = [
-            b
-            for b in (self._save_video_btn, getattr(self, "_sidebar_save_video_btn", None))
-            if b is not None
-        ]
-        lbl = self._video_frames_label
-        if not btns and lbl is None:
-            return
-        if self._video_save_in_progress:
-            for btn in btns:
-                btn.configure(state="disabled", text="Encoding...")
-            target = self._video_export_target
-            target_name = Path(target).name if target else "video.mp4"
-            if lbl is not None:
-                try:
-                    lbl.configure(
-                        text=f"Encoding video -> {target_name}...",
-                        text_color=WARNING,
-                    )
-                except (AttributeError, tk.TclError):
-                    pass
-            return
-        if self._has_ready_video_frames():
-            for btn in btns:
-                btn.configure(state="normal", text="Save Video")
-            try:
-                count = int(self._video_frames_count) or count_saved_video_frames(
-                    self._video_frames_dir
-                )
-            except (TypeError, ValueError, OSError):
-                count = 0
-            try:
-                fps = float(self._video_frames_fps or 30.0)
-            except (TypeError, ValueError):
-                fps = 30.0
-            jid = self._video_frames_job_id
-            job_txt = f" (Job #{jid})" if jid is not None else ""
-            text = f"{count} frames ready{job_txt} @ {fps:g} fps: pick a quality and Save Video."
-            last = self._video_last_save
-            if last:
-                last_crf = self._video_last_crf
-                suffix = f" (CRF {last_crf})" if last_crf is not None else ""
-                text += f"\nLast saved: {Path(last).name}{suffix}."
-            if lbl is not None:
-                try:
-                    lbl.configure(text=text, text_color=TEXT_LABEL)
-                except (AttributeError, tk.TclError):
-                    pass
-        else:
-            for btn in btns:
-                btn.configure(state="disabled", text="Save Video")
-            if lbl is not None:
-                try:
-                    lbl.configure(
-                        text="No video frames yet. Run a Zoom/Video generation first.",
-                        text_color=TEXT_DIM,
-                    )
-                except (AttributeError, tk.TclError):
-                    pass
-
-    def _default_video_save_name(self, out_dir=None):
-        crf = self._get_current_crf()
-
-        job = self._video_frames_job
-        jid = self._video_frames_job_id
-        if job is None and jid is not None:
-            for j in self._job_queue:
-                if getattr(j, "id", None) == jid:
-                    job = j
-                    break
-
-        return suggest_video_name(
-            job=job,
-            frames_dir=self._video_frames_dir,
-            source=self._video_frames_source,
-            mode=self._video_frames_mode,
-            crf=crf,
-            out_dir=out_dir if out_dir is not None else resolve_out_dir(self._out_dir.get()),
-        )
-
-    def _build_encode_cmd(self, frames_dir, out_path, fps, audio_from=None):
-        return VideoExportRequest(
-            frames_dir=frames_dir,
-            out_path=out_path,
-            fps=float(fps),
-            quality=self._video_quality_var.get() or "",
-            crf=self._get_current_crf(),
-            audio_from=audio_from,
-        ).build_cmd()
-
-    def _on_save_video_click(self):
-        if self._video_save_in_progress or not self._has_ready_video_frames():
-            return
-        frames_dir = self._video_frames_dir
-        count = self._video_frames_count or count_saved_video_frames(frames_dir)
-        fps = float(self._video_frames_fps or 30.0)
-        crf = self._get_current_crf()
-        mode = self._video_frames_mode or ""
-        audio_from = None
-        if "video" in mode.lower():
-            src = self._video_frames_source
-            if src and os.path.isfile(src):
-                audio_from = src
-        out_dir = resolve_out_dir(self._out_dir.get())
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except OSError:
-            pass
-        default_name = self._default_video_save_name(out_dir=out_dir)
-        path = filedialog.asksaveasfilename(
-            title="Save dreamed video",
-            initialdir=out_dir,
-            initialfile=default_name,
-            defaultextension=".mp4",
-            filetypes=[("MP4 video", "*.mp4"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        if not path.lower().endswith(".mp4"):
-            path += ".mp4"
-        cmd = self._build_encode_cmd(frames_dir, path, fps, audio_from)
-        qname = (self._video_quality_var.get() or "Custom").strip() or "Custom"
-        self._log_msg(
-            f"\n[Video Export] {count} frames @ {fps:g} fps ({qname}, CRF {crf}) -> {path}\n"
-            f"$ {' '.join(cmd)}\n\n",
-            color=TEXT_DIM,
-        )
-        self._video_save_in_progress = True
-        self._video_export_target = path
-        self._tracker = ProgressTracker()
-        self._progress.set(0)
-        self._status_label.configure(text="Encoding video...", text_color=WARNING)
-        self._stop_video_playback()
-        try:
-            self._preview_title.configure(text=f"Encoding Video -> {Path(path).name}...")
-        except tk.TclError:
-            pass
-        self._output_path = None
-        if not self._queue_running and self._proc is None:
-            self._stop_btn.configure(state="normal", text_color=TEXT_MAIN)
-        self._refresh_video_save_ui()
-        job_id = self._video_frames_job_id
-        try:
-            proc = self._start_encode_process(cmd)
-        except OSError as exc:
-            self._finish_video_encode(
-                -1, f"Error: could not start video export: {exc}\n", path, job_id
-            )
-            return
-        # Started on the Tk thread so _stop() can never miss the process.
-        self._encode_proc = proc
-        self._ensure_poll()
-        threading.Thread(
-            target=self._run_video_encode,
-            daemon=True,
-            args=(cmd, proc, path, job_id, count, fps, crf),
-        ).start()
-
-    def _handle_encode_line(self, line, out_path):
-        if self._is_closing:
-            return
-        if parse_event(line) is None:
-            self._log_msg(line)
-        frac, status = self._tracker.update(line)
-        if frac is not None:
-            self._progress.set(frac)
-        if status:
-            self._status_label.configure(text=status, text_color=WARNING)
-            lbl = self._video_frames_label
-            if lbl is not None and self._video_save_in_progress:
-                try:
-                    dest_name = Path(out_path).name
-                    lbl.configure(
-                        text=f"{status} -> {dest_name}",
-                        text_color=WARNING,
-                    )
-                except tk.TclError:
-                    pass
-        if line.strip().startswith("Done in"):
-            self._status_label.configure(text="Video saved ✓", text_color=SUCCESS)
-            self._progress.set(1.0)
-
-    def _start_encode_process(self, cmd):
-        """Start the encode subprocess. Called on the Tk thread."""
-        return start_cli_process(cmd, ROOT)
-
-    def _run_video_encode(self, cmd, proc, out_path, job_id, count, fps, crf):
-        """Worker thread: stream an already-started encode subprocess into the queue.
-
-        Touches no Tk state and no Tcl calls. The process is started on the Tk
-        thread by _on_save_video_click so _stop() can always see it; log lines
-        and the final result are queued for _poll_log to apply on the Tk thread.
-        """
-        read_encode_output(proc, out_path, job_id, self._encode_queue)
-
-    def _finish_video_encode(self, rc, log_text, out_path, job_id):
-        self._video_save_in_progress = False
-        self._video_export_target = None
-        # Cleared on the Tk thread so _stop() never races the worker's assignment.
-        self._encode_proc = None
-        if not self._queue_running and self._proc is None:
-            self._stop_btn.configure(state="disabled", text_color=TEXT_DIM)
-        if self._is_closing:
-            return
-        if log_text:
-            self._log_msg(log_text if log_text.endswith("\n") else log_text + "\n")
-        ok = rc == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0
-        if ok:
-            try:
-                crf = int(self._video_crf.get())
-            except (ValueError, tk.TclError):
-                crf = None
-            self._output_path = out_path
-            self._video_last_save = out_path
-            self._video_last_crf = crf
-            self._progress.set(1.0)
-            self._status_label.configure(text="Video saved ✓", text_color=SUCCESS)
-            for j in self._job_queue:
-                if getattr(j, "id", None) == job_id:
-                    j.output_path = out_path
-                    break
-            self._is_video_output = True
-            self._timelapse_mp4 = None
-            try:
-                self._view_image_btn.grid_remove()
-                self._view_timelapse_btn.grid_remove()
-            except tk.TclError:
-                pass
-            ok_preview = self._setup_mp4_preview(
-                out_path, title=f"Video Saved: {Path(out_path).name}"
-            )
-            if not ok_preview:
-                try:
-                    self._preview_title.configure(text=f"Video Saved: {Path(out_path).name}")
-                except tk.TclError:
-                    pass
-            self._open_dir_btn.grid()
-            self._log_msg(
-                f"\nSaved: {out_path}\n"
-                "Previewing in-window; scrub or press Play. "
-                "You can Save Video again at another quality without re-dreaming.\n",
-                color=SUCCESS,
-            )
-        else:
-            self._output_path = None
-            self._progress.set(0)
-            self._status_label.configure(text="Export failed", text_color=ERROR_COL)
-            self._log_msg("\nVideo export failed. See the log above.\n", color=ERROR_COL)
-            try:
-                messagebox.showerror(
-                    "Video Export Failed",
-                    "Could not export the video.\nSee the console log for details.",
-                )
-            except tk.TclError:
-                pass
-        self._refresh_video_save_ui()
-
-    def _on_timelapse_toggle(self):
-        self._update_video_quality_visibility()
-
-    def _update_video_quality_visibility(self, mode=None):
-        if self._video_quality_frame is None:
-            return
-        if mode is None:
-            mode = self._mode_var.get()
-        if (
-            mode in ("Dream Zoom", "Dream Video")
-            or self._timelapse.get()
-            or self._has_ready_video_frames()
-        ):
-            self._video_quality_frame.grid(row=17, column=0, sticky="ew", padx=16, pady=(0, 8))
-        else:
-            self._video_quality_frame.grid_remove()
-
     def _on_preset_change(self, name):
         p = PRESETS.get(name)
         if not p:
@@ -2782,348 +1802,6 @@ class DeepDreamGUI(tk.Tk):
             self._guide_frame.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 8))
         elif mode == "Target Class":
             self._class_frame.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 8))
-
-    # Target Class management (searchable & mouse-selectable)
-
-    def _on_target_class_var_changed(self, *args):
-        if self._class_selected_label is None:
-            return
-        val = self._target_class_var.get().strip()
-        if val:
-            res = lookup_category(val)
-            if res:
-                idx, name, label = res
-                self._class_selected_label.configure(
-                    text=f"Target: {label}",
-                    text_color=SUCCESS,
-                )
-                if self._class_dropdown is not None:
-                    try:
-                        cur_vals = self._class_dropdown.cget("values") or []
-                        if label not in cur_vals:
-                            cur_vals = [label] + [v for v in cur_vals if v != label]
-                            self._class_dropdown.configure(values=cur_vals)
-                        self._class_dropdown.set(label)
-                    except (tk.TclError, AttributeError):
-                        pass
-            else:
-                # An unresolvable value must not read as a valid target: the
-                # CLI would reject it and the job would fail after starting.
-                self._class_selected_label.configure(
-                    text=f"Target: {val} (unrecognized \u2014 pick from the list)",
-                    text_color=ERROR_COL,
-                )
-        else:
-            self._class_selected_label.configure(
-                text="No target selected (search or click below)",
-                text_color=TEXT_LABEL,
-            )
-
-    def _on_class_search_changed(self, *args):
-        self._update_class_list_display()
-
-    def _update_class_list_display(self):
-        if self._class_dropdown is None or self._class_listbox is None:
-            return
-        query = self._class_search_var.get().strip()
-        filter_name = self._class_filter_name
-
-        cat_filter = (
-            None if (filter_name in ("Popular", "★ Popular", "All") and query) else filter_name
-        )
-        matches = search_categories(query, category_filter=cat_filter)
-        if not matches and cat_filter is not None:
-            matches = search_categories(query, category_filter=None)
-
-        if matches:
-            vals = [m[2] for m in matches]
-        else:
-            vals = ["No matching categories"]
-
-        self._class_dropdown.configure(values=vals)
-        if matches:
-            self._class_dropdown.set(vals[0])
-        else:
-            self._class_dropdown.set("No matching categories")
-
-        self._class_listbox.delete(0, tk.END)
-        for v in vals:
-            self._class_listbox.insert(tk.END, f"  {v}")
-
-    def _on_class_category_filter_change(self, val):
-        self._class_filter_name = val
-        if self._class_search_var.get():
-            self._class_search_var.set("")
-        else:
-            self._update_class_list_display()
-
-    def _on_class_dropdown_select(self, choice):
-        if not choice or choice == "No matching categories":
-            return
-        self._target_class_var.set(choice)
-        if self._class_listbox is not None:
-            self._class_listbox.selection_clear(0, tk.END)
-            for i in range(self._class_listbox.size()):
-                item_text = self._class_listbox.get(i).strip()
-                if item_text == choice.strip():
-                    self._class_listbox.selection_set(i)
-                    self._class_listbox.see(i)
-                    break
-
-    def _on_class_listbox_select(self, event=None):
-        if self._class_listbox is None:
-            return
-        sel = self._class_listbox.curselection()
-        if not sel:
-            return
-        chosen = self._class_listbox.get(sel[0]).strip()
-        if not chosen or chosen == "No matching categories":
-            return
-        self._target_class_var.set(chosen)
-        if self._class_dropdown is not None:
-            self._class_dropdown.set(chosen)
-
-    def _class_list_row_pixels(self):
-        """Approximate pixel height of one listbox row for drag-resizing."""
-        try:
-            import tkinter.font as _tkfont
-
-            f = _tkfont.Font(font=self._class_listbox.cget("font"))
-            return max(12, int(f.metrics("linespace")) + 2)
-        except (tk.TclError, RuntimeError, TypeError):
-            return 16
-
-    def _on_class_list_resize_start(self, event=None):
-        try:
-            h = int(self._class_listbox.cget("height"))
-        except (ValueError, tk.TclError):
-            h = self._class_listbox_height
-        y = getattr(event, "y_root", 0) or 0
-        self._class_list_resize_state = (y, h)
-        return "break"
-
-    def _on_class_list_resize_drag(self, event=None):
-        state = self._class_list_resize_state
-        if state is None or event is None:
-            return "break"
-        start_y, start_h = state
-        dy = getattr(event, "y_root", start_y) - start_y
-        row_px = max(1, self._class_list_row_pixels())
-        min_h = int(self._class_listbox_min_height)
-        max_h = int(self._class_listbox_max_height)
-        new_h = min(max_h, max(min_h, start_h + int(round(dy / float(row_px)))))
-        try:
-            if int(self._class_listbox.cget("height")) != new_h:
-                self._class_listbox.configure(height=new_h)
-                self._class_listbox_height = new_h
-        except (ValueError, tk.TclError):
-            pass
-        return "break"
-
-    def _on_class_list_resize_end(self, event=None):
-        self._class_list_resize_state = None
-        return "break"
-
-    def _clear_target_class(self):
-        self._target_class_var.set("")
-        if self._class_listbox is not None:
-            self._class_listbox.selection_clear(0, tk.END)
-        if self._class_dropdown is not None:
-            self._class_dropdown.set("")
-
-    def _clear_class_search(self):
-        self._class_search_var.set("")
-
-    def _on_class_search_enter(self, event=None):
-        if self._class_listbox is None or self._class_listbox.size() == 0:
-            return
-        first = self._class_listbox.get(0).strip()
-        if first and first != "No matching categories":
-            self._target_class_var.set(first)
-            if self._class_dropdown is not None:
-                self._class_dropdown.set(first)
-
-    # Multi-layer management (integrated in-window)
-
-    def _on_single_layer_select(self, val):
-        self._custom_layers_var.set("")
-        self._layer_mode_var.set("Single Layer")
-        self._update_layer_ui()
-
-    def _on_layer_mode_change(self, mode=None):
-        if mode is not None:
-            self._layer_mode_var.set(mode)
-        else:
-            mode = self._layer_mode_var.get()
-        if mode == "Multi-Layer":
-            if not self._custom_layers_var.get().strip():
-                # Seed multi-layer with currently selected single layer
-                model_key = MODEL_BY_LABEL.get(self._model_var.get(), DEFAULT_MODEL_KEY)
-                layer_value_map = _layer_value_map(model_key)
-                cur_key = layer_value_map.get(
-                    self._layer_var.get(), self._layer_var.get().split()[0]
-                )
-                self._custom_layers_var.set(cur_key)
-        else:
-            self._custom_layers_var.set("")
-        self._update_layer_ui()
-
-    def _on_custom_layers_var_changed(self, *args):
-        if self._layer_chips_container is not None:
-            self._refresh_layer_chips()
-
-    def _toggle_layer(self, key):
-        if self._proc and self._proc.poll() is None:
-            return
-        raw = self._custom_layers_var.get().strip()
-        layers = [layer_name.strip() for layer_name in raw.split(",") if layer_name.strip()]
-        if key in layers:
-            layers.remove(key)
-        else:
-            layers.append(key)
-        self._custom_layers_var.set(",".join(layers))
-        self._refresh_layer_chips()
-
-    def _select_recommended_layers(self):
-        if self._proc and self._proc.poll() is None:
-            return
-        model_key = MODEL_BY_LABEL.get(self._model_var.get(), DEFAULT_MODEL_KEY)
-        rec = RECOMMENDED_MULTI_LAYERS.get(model_key, ["inception4c", "inception5b"])
-        self._custom_layers_var.set(",".join(rec))
-        self._refresh_layer_chips()
-
-    def _select_all_layers(self):
-        if self._proc and self._proc.poll() is None:
-            return
-        model_key = MODEL_BY_LABEL.get(self._model_var.get(), DEFAULT_MODEL_KEY)
-        meta = MODEL_META.get(model_key, MODEL_META[DEFAULT_MODEL_KEY])
-        all_keys = [k for k, _ in meta["layers"]]
-        self._custom_layers_var.set(",".join(all_keys))
-        self._refresh_layer_chips()
-
-    def _remove_layer_chip(self, key):
-        if self._proc and self._proc.poll() is None:
-            return
-        raw = self._custom_layers_var.get().strip()
-        layers = [layer_name.strip() for layer_name in raw.split(",") if layer_name.strip()]
-        if key in layers:
-            layers.remove(key)
-        self._custom_layers_var.set(",".join(layers))
-        self._refresh_layer_chips()
-
-    def _clear_multi_layers(self):
-        if self._proc and self._proc.poll() is None:
-            return
-        self._custom_layers_var.set("")
-        self._refresh_layer_chips()
-
-    def _update_layer_ui(self):
-        mode = self._layer_mode_var.get()
-        if self._layer_mode_seg is not None:
-            self._layer_mode_seg.set(mode)
-        if mode == "Multi-Layer":
-            if self._single_layer_frame is not None:
-                self._single_layer_frame.grid_remove()
-            if self._multi_layer_frame is not None:
-                self._multi_layer_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
-            self._refresh_layer_chips()
-        else:
-            if self._multi_layer_frame is not None:
-                self._multi_layer_frame.grid_remove()
-            if self._single_layer_frame is not None:
-                self._single_layer_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
-
-    def _refresh_layer_chips(self):
-        if self._layer_chips_container is None:
-            return
-        for child in self._layer_chips_container.winfo_children():
-            child.destroy()
-
-        model_key = MODEL_BY_LABEL.get(self._model_var.get(), DEFAULT_MODEL_KEY)
-        meta = MODEL_META.get(model_key, MODEL_META[DEFAULT_MODEL_KEY])
-        layer_items = meta["layers"]
-        layer_desc_map = dict(layer_items)
-        tiers = LAYER_TIERS.get(model_key, [])
-
-        raw = self._custom_layers_var.get().strip()
-        active_layers = [layer_name.strip() for layer_name in raw.split(",") if layer_name.strip()]
-
-        if self._layer_badge_count is not None:
-            self._layer_badge_count.configure(text=f"Active ({len(active_layers)})")
-
-        self._layer_chips_container.grid_columnconfigure(0, weight=1)
-        self._layer_chips_container.grid_columnconfigure(1, weight=1)
-
-        row_idx = 0
-        used_keys = set()
-
-        for tier_title, _tier_sub, tier_keys in tiers:
-            matching = [k for k in tier_keys if k in layer_desc_map]
-            if not matching:
-                continue
-            row_idx = self._add_layer_tier_label(tier_title, row_idx)
-            used_keys.update(matching)
-            row_idx = self._add_layer_chips(matching, active_layers, layer_desc_map, row_idx)
-
-        # Any leftover keys not in tiers
-        leftovers = [k for k, _ in layer_items if k not in used_keys]
-        if leftovers:
-            row_idx = self._add_layer_tier_label("Other Layers", row_idx)
-            self._add_layer_chips(leftovers, active_layers, layer_desc_map, row_idx)
-
-    def _add_layer_tier_label(self, title, row_idx):
-        """Render a tier heading in the chips grid; returns the next free row."""
-        lbl = ModernLabel(
-            self._layer_chips_container,
-            text=title,
-            font=ModernFont(family="Segoe UI", size=9, weight="bold"),
-            text_color=TEXT_LABEL,
-            anchor="w",
-        )
-        lbl.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 2))
-        return row_idx + 1
-
-    def _add_layer_chips(self, keys, active_layers, layer_desc_map, row_idx):
-        """Render one group of layer chips in a two-column grid; returns the next row."""
-        for j, key in enumerate(keys):
-            is_active = key in active_layers
-            raw_desc = layer_desc_map[key]
-            clean_desc = raw_desc.split(" - ", 1)[1].strip() if " - " in raw_desc else raw_desc
-
-            r = row_idx + (j // 2)
-            c = j % 2
-
-            btn = ModernButton(
-                self._layer_chips_container,
-                text=f"✓ {key}" if is_active else f"+ {key}",
-                height=26,
-                fg_color=ACCENT if is_active else BG_CARD,
-                hover_color=ACCENT_HOVER if is_active else BORDER,
-                text_color=BG_DEEP if is_active else TEXT_DIM,
-                border_width=0 if is_active else 1,
-                border_color=BORDER,
-                font=ModernFont(
-                    family="Segoe UI",
-                    size=10,
-                    weight="bold" if is_active else "normal",
-                ),
-                command=(
-                    (lambda k=key: self._remove_layer_chip(k))
-                    if is_active
-                    else (lambda k=key: self._toggle_layer(k))
-                ),
-            )
-            if len(keys) % 2 == 1 and j == len(keys) - 1 and c == 0:
-                btn.grid(row=r, column=0, columnspan=2, padx=3, pady=2, sticky="ew")
-            else:
-                btn.grid(row=r, column=c, padx=3, pady=2, sticky="ew")
-
-            Tooltip(
-                btn,
-                f"{key}: {clean_desc}\n"
-                f"Status: {'Active (click to deactivate)' if is_active else 'Inactive (click to activate)'}",
-            )
-        return row_idx + (len(keys) + 1) // 2
 
     # Image & Media browsing / preview
 
@@ -3792,141 +2470,6 @@ class DeepDreamGUI(tk.Tk):
     # Save Video, or a saved .mp4 / timelapse decoded via imageio. Both use the
     # same zoom/pan viewport as stills.
 
-    def _hide_video_bar(self):
-        self._stop_video_playback()
-        try:
-            self._video_bar.grid_remove()
-        except (tk.TclError, AttributeError):
-            pass
-
-    def _show_video_bar(self):
-        try:
-            self._video_bar.grid(row=4, column=0, sticky="ew", padx=10, pady=(2, 2))
-        except (tk.TclError, AttributeError):
-            pass
-
-    def _loader_generation(self):
-        loader = getattr(self, "_video_loader", None)
-        return loader.generation() if loader is not None else None
-
-    def _on_video_probe_result(self, path, total, fps, token, generation):
-        """Tk-thread handler for an async probe."""
-        if self._is_closing:
-            return
-        if self._video_kind != "mp4" or self._video_mp4 != path:
-            return
-        if generation != self._loader_generation():
-            return
-        if token is not None and token != self._video_probe_token:
-            return
-        if total <= 0:
-            # Undecodable header: keep the frame the loader already fetched as a
-            # still, so a codec hiccup never blanks the preview.
-            frame = self._video_cache.get(("mp4", path, 0))
-            if frame is None:
-                return
-            self._teardown_video()
-            self._viewer_mode = "image"
-            self._show_output_preview(frame, reset_view=True)
-            title = getattr(self, "_video_pending_title", None)
-            if title:
-                try:
-                    self._preview_title.configure(text=title)
-                except tk.TclError:
-                    pass
-            return
-        self._video_total = int(total)
-        self._video_fps = float(fps) if fps and float(fps) > 0 else 30.0
-        self._video_pending_title = None
-        self._show_video_frame(self._video_index)
-
-    def _on_video_frame_result(self, kind, source, index, frame, token, generation):
-        """Tk-thread handler for a decoded frame."""
-        if self._is_closing or frame is None:
-            return
-        if generation != self._loader_generation():
-            return
-        if kind != self._video_kind:
-            return
-        if kind == "mp4" and source != self._video_mp4:
-            return
-        if kind == "frames":
-            paths = self._video_paths or []
-            if not (0 <= int(index) < len(paths)) or paths[int(index)] != source:
-                return
-        self._video_cache.put((kind, source, int(index)), frame)
-        # Only display if the user is still on this frame; otherwise the decode
-        # is just a cache warm-up for a scrub that has already moved on.
-        if int(index) == int(self._video_requested_index):
-            self._render_viewer()
-
-    def _request_video_frame(self, index):
-        """Ask for a frame and render it if already cached."""
-        kind = self._video_kind
-        if kind == "frames":
-            paths = self._video_paths or []
-            if not paths:
-                return
-            i = max(0, min(len(paths) - 1, int(index)))
-            source = paths[i]
-        elif kind == "mp4":
-            mp4 = self._video_mp4
-            if not mp4 or not os.path.isfile(mp4):
-                return
-            i = max(0, int(index))
-            source = mp4
-        else:
-            return
-        self._video_requested_index = i
-        key = (kind, source, i)
-        cached = self._video_cache.get(key)
-        if cached is not None:
-            self._render_viewer()
-            return
-        loader = getattr(self, "_video_loader", None)
-        if loader is not None:
-            loader.request_frame(kind, source, i)
-            self._ensure_video_poll()
-
-    def _ensure_video_poll(self):
-        if self._video_poll_after_id is not None or self._is_closing:
-            return
-        try:
-            self._video_poll_after_id = self.after(16, self._poll_video_loader)
-        except tk.TclError:
-            self._video_poll_after_id = None
-
-    def _poll_video_loader(self):
-        self._video_poll_after_id = None
-        if self._is_closing:
-            return
-        loader = getattr(self, "_video_loader", None)
-        if loader is None:
-            return
-        pending = loader.poll()
-        if pending:
-            self._video_poll_after_id = self.after(16, self._poll_video_loader)
-
-    def _load_video_frame(self, index):
-        """PIL frame for the active video source at *index* (or None).
-
-        Cache-only: decoding happens on the loader thread so the Tk thread never
-        blocks. Use _request_video_frame to ask for a frame that is not cached.
-        """
-        kind = self._video_kind
-        if kind == "frames":
-            paths = self._video_paths or []
-            if not paths:
-                return None
-            i = max(0, min(len(paths) - 1, int(index)))
-            return self._video_cache.get((kind, paths[i], i))
-        if kind == "mp4":
-            mp4 = self._video_mp4
-            if not mp4:
-                return None
-            return self._video_cache.get((kind, mp4, max(0, int(index))))
-        return None
-
     def _setup_frames_preview(self, frames_dir, fps=30.0, title=None):
         paths = list_saved_video_frames(frames_dir)
         if not paths:
@@ -3988,144 +2531,6 @@ class DeepDreamGUI(tk.Tk):
             except tk.TclError:
                 pass
         return True
-
-    def _reset_video_loader(self):
-        """Point the loader at a new source: drop queued decodes and stale results."""
-        loader = getattr(self, "_video_loader", None)
-        if loader is not None:
-            loader.invalidate()
-
-    def _teardown_video(self):
-        self._stop_video_playback()
-        self._reset_video_loader()
-        self._video_kind = None
-        self._video_paths = []
-        self._video_mp4 = None
-        self._video_total = 0
-        self._video_index = 0
-        self._video_cache = FrameCache()
-        if self._viewer_mode == "video":
-            self._viewer_mode = "image"
-        if self._video_bar is not None:
-            try:
-                self._video_bar.grid_remove()
-            except tk.TclError:
-                pass
-
-    def _show_video_frame(self, index):
-        total = int(self._video_total or 0)
-        if total <= 0:
-            return
-        i = max(0, min(total - 1, int(index)))
-        self._video_index = i
-        self._request_video_frame(i)
-        try:
-            fps = float(self._video_fps or 30.0)
-        except (TypeError, ValueError):
-            fps = 30.0
-        if self._video_pos_label is not None:
-            try:
-                self._video_pos_label.configure(text=format_frame_label(i, total, fps))
-            except tk.TclError:
-                pass
-        self._video_slider_sync = True
-        try:
-            if self._video_slider is not None:
-                self._video_slider.set(timeline_index_to_t(i, total))
-        except tk.TclError:
-            pass
-        finally:
-            self._video_slider_sync = False
-        if self._video_play_btn is not None:
-            try:
-                self._video_play_btn.configure(state="normal" if total > 1 else "disabled")
-            except tk.TclError:
-                pass
-
-    def _on_video_play_pause(self):
-        if self._video_playing:
-            self._stop_video_playback()
-        else:
-            self._start_video_playback()
-
-    def _start_video_playback(self):
-        total = int(self._video_total or 0)
-        if total <= 1:
-            return
-        # Restart from the start when pressing play at the end.
-        if int(self._video_index) >= total - 1:
-            self._video_index = 0
-        self._video_playing = True
-        if self._video_play_btn is not None:
-            try:
-                self._video_play_btn.configure(text="⏸ Pause")
-            except tk.TclError:
-                pass
-        self._schedule_video_tick()
-
-    def _stop_video_playback(self):
-        self._video_playing = False
-        aid = self._video_after_id
-        if aid is not None:
-            try:
-                self.after_cancel(aid)
-            except tk.TclError:
-                pass
-            self._video_after_id = None
-        if self._video_play_btn is not None:
-            try:
-                self._video_play_btn.configure(text="▶ Play")
-            except tk.TclError:
-                pass
-
-    def _schedule_video_tick(self):
-        try:
-            fps = float(self._video_fps or 30.0)
-        except (TypeError, ValueError):
-            fps = 30.0
-        delay = int(round(1000.0 / fps)) if fps > 0 else 33
-        delay = max(16, min(2000, delay))
-        _pending = self._video_after_id
-        if _pending is not None:
-            try:
-                self.after_cancel(_pending)
-            except tk.TclError:
-                pass
-        try:
-            self._video_after_id = self.after(delay, self._video_tick)
-        except tk.TclError:
-            pass
-
-    def _video_tick(self):
-        self._video_after_id = None
-        if not self._video_playing:
-            return
-        if self._is_closing:
-            self._video_playing = False
-            return
-        total = int(self._video_total or 0)
-        if total <= 0:
-            self._stop_video_playback()
-            return
-        nxt = int(self._video_index) + 1
-        if nxt >= total:
-            # Loop the preview so short clips can be judged without replay.
-            nxt = 0
-        self._show_video_frame(nxt)
-        if self._video_playing:
-            self._schedule_video_tick()
-
-    def _on_video_slider_change(self, value):
-        if self._video_slider_sync:
-            return
-        total = int(self._video_total or 0)
-        if total <= 0:
-            return
-        try:
-            t = float(value)
-        except (TypeError, ValueError):
-            return
-        self._show_video_frame(timeline_t_to_index(t, total))
 
     def _on_view_image_toggle(self):
         # Back to the still image when both a still and a timelapse exist.
@@ -4337,8 +2742,8 @@ class DeepDreamGUI(tk.Tk):
             if guidance_mode == "Target Class":
                 layer_spec = ""
             else:
-                layer_value_map = _layer_value_map(model_key)
-                layer_spec = layer_value_map.get(self._layer_var.get(), self._layer_var.get())
+                label_to_key = layer_value_map(model_key)
+                layer_spec = label_to_key.get(self._layer_var.get(), self._layer_var.get())
 
         ui_mode = self._mode_var.get()
         mode = ui_mode
@@ -4759,6 +3164,7 @@ class DeepDreamGUI(tk.Tk):
         self._queue_running = False
         self._cancel_next_job_timer()
         encode_proc = self._encode_proc
+        stopped_child = False
         if self._proc and self._proc.poll() is None:
             self._aborted = True
             job = self._current_job
@@ -4766,10 +3172,14 @@ class DeepDreamGUI(tk.Tk):
                 self._aborted_jobs.add(job.id)
             terminate_process(self._proc)
             self._log_msg("\n[Queue stopped by user]\n", color=WARNING)
-        elif encode_proc and encode_proc.poll() is None:
+            stopped_child = True
+        if encode_proc and encode_proc.poll() is None:
             terminate_process(encode_proc)
             self._log_msg("\n[Video export stopped by user]\n", color=WARNING)
-        elif self._proc is not None:
+            stopped_child = True
+        if stopped_child:
+            return
+        if self._proc is not None:
             # Process already exited but its reader-thread sentinel is still
             # queued, so don't paint "Stopped" now. The pending
             # _on_process_finished() owns the final status.
@@ -4926,24 +3336,6 @@ class DeepDreamGUI(tk.Tk):
             self._preview_title.configure(text="Dreaming… (Live Intermediate)")
         except (OSError, ValueError):
             pass
-
-    def _drain_encode_queue(self) -> bool:
-        """Apply queued video-encode events on the Tk thread."""
-        finished = False
-        while True:
-            try:
-                event = self._encode_queue.get_nowait()
-            except queue.Empty:
-                break
-            if not isinstance(event, tuple) or not event:
-                continue
-            kind = event[0]
-            if kind == "line" and len(event) >= 3:
-                self._handle_encode_line(event[1], event[2])
-            elif kind == "done" and len(event) >= 5:
-                finished = True
-                self._finish_video_encode(event[1], event[2], event[3], event[4])
-        return finished
 
     def _mark_stale_job_stopped(self, job_id):
         """Mark a job whose subprocess was replaced as Stopped (idempotent)."""

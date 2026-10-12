@@ -191,6 +191,25 @@ DeepDream Studio aims to be a modern, self-contained DeepDream tool: a single la
 
 Much of the application code in this repository was generated with the assistance of AI coding agents. See [LICENSE](LICENSE) for the project's licensing terms.
 
+## Beta status
+
+DeepDream Studio is a beta: the core image, zoom, and video workflows are usable,
+but behavior may still change and some platform combinations have not been
+validated on real hardware.
+
+- Automated tests run on Windows, Linux, and macOS across Python 3.11–3.14
+  (macOS excludes 3.14), always on CPU; the numerical engine has additionally
+  been verified locally on an NVIDIA CUDA GPU.
+- Linux CUDA and Apple Silicon (MPS) runs are not covered by CI and still need
+  real-hardware validation. Reports from those systems are welcome.
+- Wheel installs use compatible dependency ranges; the launchers install the
+  tested baseline pinned in `constraints-runtime.txt`.
+- Test coverage focuses on the engine, recovery paths, and GUI component logic;
+  it is not exhaustive, and CLI/encoding subprocesses are not instrumented.
+
+Maintainers verify each release with the checklist in
+[CONTRIBUTING.md](CONTRIBUTING.md#release-validation).
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, checks, dependency

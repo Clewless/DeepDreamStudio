@@ -20,7 +20,20 @@ def test_bundle_rejects_missing_launcher_before_running_setup(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
-    "omitted", ["app/gui_export.py", "app/gui_process.py", "app/gui_viewer.py", "app/model_data.py"]
+    "omitted",
+    [
+        "app/dream_engine.py",
+        "app/gui_classifier.py",
+        "app/gui_export.py",
+        "app/gui_layers.py",
+        "app/gui_playback.py",
+        "app/gui_process.py",
+        "app/gui_video.py",
+        "app/gui_viewer.py",
+        "app/model_data.py",
+        "app/media_io.py",
+        "app/models.py",
+    ],
 )
 def test_bundle_rejects_missing_application_module(tmp_path: Path, omitted: str) -> None:
     root = Path(__file__).resolve().parent.parent

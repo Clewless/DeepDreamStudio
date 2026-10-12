@@ -644,16 +644,19 @@ class TestDeepDream(unittest.TestCase):
         self.assertIsNone(deepdream.octave_truncation_note(3, 3, 1.4))
         # Image too small (MIN_OCTAVE_SIZE): the classic message.
         note = deepdream.octave_truncation_note(3, 1, 1.4)
+        assert note is not None
         self.assertIn("image too small", note)
         self.assertIn("running 1 instead", note)
         # Only the MAX_OCTAVES cap binds: must say "capped", not "too small".
         note = deepdream.octave_truncation_note(
             deepdream.MAX_OCTAVES + 10, deepdream.MAX_OCTAVES, 1.01
         )
+        assert note is not None
         self.assertIn("capped", note)
         self.assertNotIn("too small", note)
         # Cap and image size bind together.
         note = deepdream.octave_truncation_note(deepdream.MAX_OCTAVES + 10, 5, 1.4)
+        assert note is not None
         self.assertIn("exceeds the", note)
         self.assertNotIn("too small", note)
 
@@ -661,10 +664,12 @@ class TestDeepDream(unittest.TestCase):
         # Auto mode near octave-scale 1.0: the MAX_OCTAVES cap stops the pyramid
         # short of the ~250px base octave, so a note must explain it.
         note = deepdream.octave_truncation_note(0, deepdream.MAX_OCTAVES, 1.0001, auto_capped=True)
+        assert note is not None
         self.assertIn("capped", note)
         self.assertIn(f"running {deepdream.MAX_OCTAVES} instead", note)
         # Capped AND the image can't fit the full cap: say both.
         note = deepdream.octave_truncation_note(0, 5, 1.4, auto_capped=True)
+        assert note is not None
         self.assertIn("can't fit", note)
         # Auto without the cap still warrants no note.
         self.assertIsNone(deepdream.octave_truncation_note(0, 3, 1.4, auto_capped=False))
@@ -1938,7 +1943,7 @@ class TestModelExecutionValidation(unittest.TestCase):
 
     def test_activation_loss_empty_acts_raises(self):
         with self.assertRaises(RuntimeError):
-            deepdream._activation_loss({}, {"inception3a": 1.0})
+            deepdream._activation_loss({}, {"inception3a": torch.tensor(1.0)})
 
     def test_validate_input_size_unknown_model(self):
         with self.assertRaises(SystemExit):

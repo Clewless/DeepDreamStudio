@@ -4,10 +4,17 @@
 
 | Module | Responsibility |
 |---|---|
-| `app/deepdream.py` | PyTorch model setup, gradient ascent, image/video generation, encoding, and CLI validation. |
+| `app/deepdream.py` | CLI validation and generation orchestration, progress logging, frame/preview output, video generation, and encoding. |
+| `app/dream_engine.py` | Numerical ascent, guided/class objectives, octave planning, and CPU-backed pyramid processing with synchronous progress callbacks. |
+| `app/models.py` | Typed runtime model registry, PyTorch model construction, layer resolution, truncated forwards, and activation hooks. |
+| `app/media_io.py` | EXIF-aware image decoding, normalized tensor conversion, and atomic image, preview, frame, and completed-video publication. |
 | `app/gui.py` | Tk widgets, user interaction, generation queue orchestration, and applying worker results. |
+| `app/gui_classifier.py` | Target-class picker: search, filters, dropdown, and listbox UI. |
 | `app/gui_job.py` | Generation settings snapshots, CLI command construction, and progress tracking. |
+| `app/gui_layers.py` | Dream-layer panel: single-layer menu, multi-layer chips, and tier grouping. |
+| `app/gui_playback.py` | In-window video bar: timeline scrubbing, play/pause, and async frame loading. |
 | `app/gui_process.py` | Consistent CLI process creation and streaming output/completion to queues. |
+| `app/gui_video.py` | Video export: quality controls, frame-sequence encoding, and encode drain. |
 | `app/gui_export.py` | Immutable video export requests and output-name planning. |
 | `app/gui_viewer.py` | Viewport coordinate mapping, cursor-centered zoom, and reveal-divider geometry. |
 | `app/gui_helpers.py` | Media decoding worker, frame cache, rendering utilities, paths, and process termination. |
@@ -17,6 +24,12 @@
 | `app/bootstrap.py`, `app/check_deps.py` | Standard-library first-launch setup and dependency verification. |
 
 ## Generation lifecycle
+
+The numerical engine does not print logs or write media. The CLI adapter supplies
+typed synchronous callbacks for startup, octave/iteration progress, and previews.
+Startup runs after numerical/input validation, so invalid settings cannot clear
+existing frames. Callbacks must not mutate tensors or consume the jitter RNG.
+The CPU pyramid and carried detail keep only the current octave on the device.
 
 1. The GUI snapshots controls into a `GenerationJob`, including its own frame
    directory and preview path.
@@ -35,6 +48,9 @@
 Zoom/video generation can retain frames and metadata independently of MP4 export.
 `VideoExportRequest` snapshots the encoding settings; export uses the same
 subprocess transport as generation. Completion is applied on the Tk thread.
+The active export retains its immutable request so completion reports the CRF
+used for encoding even if the controls change. Stop terminates both generation
+and export when they are active concurrently.
 
 Video preview decoding is performed by `VideoFrameLoader`. Requests carry tokens
 and generations so stale results can be ignored. A bounded `FrameCache` supports

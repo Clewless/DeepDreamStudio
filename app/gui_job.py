@@ -117,9 +117,7 @@ class GenerationJob:
         if preview_tmp_path:
             cmd += ["--preview-file", preview_tmp_path]
 
-        separated_save = self.mode in ("Dream Zoom", "Dream Video") and bool(
-            getattr(self, "frames_dir", None)
-        )
+        separated_save = self.mode in ("Dream Zoom", "Dream Video") and bool(self.frames_dir)
         if self.mode == "Dream Zoom":
             cmd += [
                 "--zoom",

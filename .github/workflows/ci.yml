@@ -86,7 +86,7 @@ jobs:
       - name: Warm the torch weight cache
         run: |
           python -c "import torchvision.models as m; m.googlenet(weights='IMAGENET1K_V1')"
-      - name: pytest (CPU, no display)
+      - name: pytest with branch coverage
         env:
           # GUI tests build a real Tk window; Xvfb gives them a display.
           DISPLAY: ":99"
@@ -94,10 +94,20 @@ jobs:
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             sudo apt-get install -y xvfb libxkbcommon-x11-0
-            xvfb-run -a python -m pytest -q
+            xvfb-run -a python -m pytest -q --cov --cov-report=term-missing --cov-report=xml:coverage.xml --cov-report=html:htmlcov
           else
-            python -m pytest -q
+            python -m pytest -q --cov --cov-report=term-missing --cov-report=xml:coverage.xml --cov-report=html:htmlcov
           fi
+      - name: Upload coverage reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/
+          retention-days: 14
+          if-no-files-found: warn
 
   package:
     name: Build and verify distributions

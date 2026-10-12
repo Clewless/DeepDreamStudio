@@ -138,7 +138,8 @@ markers = [
 [tool.coverage.run]
 branch = true
 source = ["app"]
-# GUI tests are skipped without a display, which would look like missing coverage.
+# Static ImageNet label data is not executable behavior. GUI code is included;
+# use a display (Xvfb on Linux) to measure its coverage meaningfully.
 omit = ["app/imagenet_categories.py"]
 
 [tool.coverage.report]

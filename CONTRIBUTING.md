@@ -58,6 +58,27 @@ For quicker feedback, use `python -m pytest -q -m "not integration and not gui"`
 Before submitting changes, run the full suite with a display. CI checks all four
 supported Python versions across Windows, Linux, and macOS, excluding macOS 3.14.
 
+### Coverage
+
+Each CI test job reports statement and branch coverage in its log and uploads
+XML plus browsable HTML as `coverage-<os>-py<version>` artifacts, retained for
+14 days. Reports are uploaded after test failures when available. Coverage is
+reported without a minimum-percentage gate while we establish the baseline.
+
+Generate the same reports locally with a usable Tk display:
+
+```sh
+python -m pytest -q --cov --cov-report=term-missing --cov-report=xml:coverage.xml --cov-report=html:htmlcov
+```
+
+On headless Linux, prefix that command with `xvfb-run -a`. Open
+`htmlcov/index.html` to inspect missed lines and branch paths. Compare reports
+from the same platform and Python version: OS-specific branches, GUI availability,
+and accelerator availability affect the result. Reports measure the test process;
+CLI and encoding subprocesses are not instrumented, and scripts are outside the
+configured `app` source scope. Prioritize uncovered cancellation, stale-worker
+handling, recovery, and output preservation over the overall percentage.
+
 ## Architecture
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities and
@@ -66,6 +87,15 @@ the generation/export lifecycle. The important boundaries are:
 - The Tk GUI never imports PyTorch. Generation and encoding run in subprocesses.
 - Workers put results onto queues; only the Tk thread updates widgets.
 - Shared model and filename metadata stays in the torch-free `model_data.py`.
+- PyTorch model loading and activation capture belong in `models.py`; its typed
+  registry keeps runtime implementation separate from presentation metadata.
+- Image decoding, tensor conversion, and atomic media publication belong in
+  `media_io.py`; generation orchestration and frame recovery remain in `deepdream.py`.
+- Numerical ascent and octave processing belong in `dream_engine.py`. CLI
+  logging, progress events, and file output are attached through synchronous
+  callbacks in `deepdream.py`. Preserve operation order and seeded jitter draws
+  when changing the numerical code; the offline numerical baselines cover all
+  four objective modes across multiple octaves.
 - Structured progress messages belong in `protocol.py`, with human-readable logs
   retained for CLI users.
 - Coordinate mapping and export planning are widget-free, independently testable
@@ -122,6 +152,28 @@ The release workflow runs the reusable CI workflow first and uploads only its
 verified ZIP, wheel, and source distribution. Bump `app/__init__.py` for a release;
 it is the single source of truth for the version. Describe changes and known beta
 limitations in the GitHub release notes.
+
+### Release validation
+
+CI covers the test suite, coverage reports, distribution builds, launcher-bundle
+verification, and the installed-wheel smoke check on every supported
+platform/Python combination, always on CPU. Before a release, complete this
+manual pass on at least one machine running the graphical app, and record the
+result (OS, Python, GPU/driver, dependency set) in the release notes.
+
+- [ ] Launch the extracted release ZIP from a fresh folder; first-launch setup
+  completes and the window appears.
+- [ ] Dream a still image on the GPU (CUDA or MPS) and again with `--no-cuda`.
+- [ ] Cancel an active generation, then start another job successfully.
+- [ ] For a zoom/video run: generate frames, press Save Video, and change the
+  quality control during encoding; the finished export reports the CRF it
+  started with, and the same frames can be exported again without re-dreaming.
+- [ ] Play and scrub the in-window preview, switch between outputs, and close
+  the window while a job is running (no orphaned processes or temp files).
+- [ ] Interrupt or kill a run mid-generation; completed outputs remain intact
+  and `--resume` continues the saved frame sequence.
+- [ ] Confirm that when the accelerator cannot start, the run continues on CPU
+  with a clear message.
 
 ## Proposing changes and reporting bugs
 
