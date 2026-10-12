@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  package:
+    name: Build and upload release assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to upload release assets
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Repackage sdist as .zip
+        run: |
+          # python -m build produces a .tar.gz sdist by default.
+          # Unpack it and repack as a .zip so the release asset is a zip file.
+          mkdir -p dist_zip
+          tar -xzf dist/*.tar.gz -C dist_zip
+          cd dist_zip
+          FOLDER=$(ls)
+          zip -r "../dist/${FOLDER}.zip" "$FOLDER"
+
+      - name: Upload .zip to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
