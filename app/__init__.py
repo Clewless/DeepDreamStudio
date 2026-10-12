@@ -5,4 +5,4 @@ launchers, documentation, and dependency files. Run the GUI with
 ``python -m app.gui`` and the CLI with ``python -m app.deepdream``.
 """
 
-__version__ = "0.1"
+__version__ = "0.1.2"
