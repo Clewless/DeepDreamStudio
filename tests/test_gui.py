@@ -2119,6 +2119,9 @@ class TestVideoExport(unittest.TestCase):
                 def readline(self):
                     return next(self._it, "")
 
+                def close(self):
+                    pass
+
             class FakeProc:
                 def __init__(self):
                     self.stdout = FakeStdout(

@@ -29,6 +29,10 @@ Launch.bat     REM Windows launcher script
 
 The first launch sets everything up automatically (see [First launch](#first-launch)).
 
+Download and extract the **`.zip` asset** from the
+[latest release](https://github.com/Clewless/DeepDreamStudio/releases/latest),
+or clone this repository, then run the launcher inside the extracted folder.
+
 Select an image from your disk by either dragging and dropping it in the window or browsing your files using your default file browser. Press the "Dream" button, and that's it!
 
 You can inspect your images using the built-in photo viewer, and find them on your disk in the "out" folder of this program's root. Generated images are saved automatically. For zoom or video runs, click **Save Video** in the GUI to export the generated frames as an MP4; source audio is copied when available for video-mode runs.
@@ -60,8 +64,10 @@ You can inspect your images using the built-in photo viewer, and find them on yo
 ├── tests/                       # Test suite
 ├── docs/images/                 # README screenshots and example results
 ├── requirements*.txt            # Dependencies
+├── constraints-runtime.txt      # Tested direct-runtime dependency baseline
 ├── pyproject.toml               # Wheel build metadata and dev tool config
 ├── README.md
+├── CONTRIBUTING.md              # Development setup and verification
 ├── LICENSE                      # Project license (BSD-3-Clause)
 └── THIRD_PARTY_NOTICES.md       # Third-party licenses
 ```
@@ -84,6 +90,10 @@ deepdream-studio
 ```
 
 The installed version and the repository can coexist; the launchers always use the local `app/` package.
+
+Source/launcher installs use the tested direct-dependency baseline in
+`constraints-runtime.txt`. Standard wheel installs use compatibility ranges;
+see [Contributing](CONTRIBUTING.md#dependencies) for reproducible setup and updates.
 
 ## Install
 
@@ -163,7 +173,7 @@ The launcher creates `.venv` here and does not install or alter system Python. M
 
 The `python3-tk` / `python3-tkinter` / `tk` / `python-tk@X.Y` packages are only needed for the GUI; CLI-only use can skip them.
 
-The import check is cached in `.deps_ok` and re-runs automatically if the requirements files or Python version change.
+The import check is cached in `.deps_ok` and re-runs automatically if the requirements, runtime constraints, or Python version change.
 
 On Windows the GUI launcher writes startup output to `deepdream-launch.log` next to the launchers: if the Studio window never appears, that file has the error.
 
@@ -180,3 +190,9 @@ This project is an independent, modern PyTorch implementation of the 2015 DeepDr
 DeepDream Studio aims to be a modern, self-contained DeepDream tool: a single launcher, fully local execution, and no cloud dependency.
 
 Much of the application code in this repository was generated with the assistance of AI coding agents. See [LICENSE](LICENSE) for the project's licensing terms.
+
+## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, checks, dependency
+updates, and release verification, and [Architecture](docs/architecture.md) for
+the module boundaries and job lifecycle.

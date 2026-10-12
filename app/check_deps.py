@@ -99,7 +99,7 @@ def fingerprint(requirements: str, required: list[str]) -> str:
     h = hashlib.sha256()
     h.update(sys.version.split()[0].encode())
     h.update(" ".join(sorted(required)).encode())
-    for name in sorted({requirements, "requirements.txt"}):
+    for name in sorted({requirements, "requirements.txt", "constraints-runtime.txt"}):
         path = ROOT / name
         if path.exists():
             h.update(name.encode())

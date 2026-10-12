@@ -1,0 +1,10 @@
+include Launch.bat Launch.sh
+include requirements*.txt constraints*.txt
+include CONTRIBUTING.md
+include .gitattributes .gitignore .pre-commit-config.yaml .markdownlint-cli2.jsonc
+recursive-include CLI *.bat *.sh *.md
+recursive-include docs *.md *.png *.jpg
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include .github/workflows *.yml
+global-exclude __pycache__ *.py[cod]

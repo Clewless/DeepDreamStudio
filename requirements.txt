@@ -2,11 +2,12 @@
 # Standard PyPI wheels for macOS (Apple Silicon MPS / Intel), Linux, and CPU.
 # For NVIDIA CUDA GPU acceleration on Windows/Linux:
 #   pip install -r requirements-cuda.txt
-# Floors (not exact pins) because the CUDA build is pinned in
-# requirements-cuda.txt. numpy is pinned to 2.x, and the Windows torch wheels
+# Floors describe compatibility; constraints-runtime.txt selects the tested
+# direct-dependency baseline for source/launcher installs. Windows torch wheels
 # were compiled against NumPy 1.x until torch 2.4.1 (even 2.4.0's are broken with
 # numpy 2; fixed in 2.4.1), so the torch floor keeps pip from resolving an
 # ABI-incompatible torch+numpy pair.
+-c constraints-runtime.txt
 torch>=2.4.1
 torchvision>=0.19.1
 numpy>=2.0

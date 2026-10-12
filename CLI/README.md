@@ -81,7 +81,7 @@ REM Zoom loop
 python -m app.deepdream photo.jpg --zoom --zoom-frames 90 --zoom-scale 1.04 --zoom-rot 0.5
 
 REM Dream an input video; blend previous frames to reduce flicker
-python -m app.deepdream clip.mp4 --video --video-blend 0.6 --layer inception4c
+python -m app.deepdream clip.mp4 --video --video-blend 0.6 --model googlenet --layer inception4c
 
 REM Record the octave-by-octave process
 python -m app.deepdream photo.jpg --timelapse --iterations 25 --octaves 4

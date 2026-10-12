@@ -228,6 +228,19 @@ class DeepCheckProbeTests(unittest.TestCase):
 
 
 class FingerprintTests(unittest.TestCase):
+    def test_changes_when_only_runtime_constraints_change(self):
+        original = Path.read_bytes
+
+        def changed_constraints(path):
+            if path.name == "constraints-runtime.txt":
+                return b"torch==99.0\n"
+            return original(path)
+
+        before = check_deps.fingerprint("requirements.txt", check_deps.REQUIRED)
+        with mock.patch.object(Path, "read_bytes", changed_constraints):
+            after = check_deps.fingerprint("requirements.txt", check_deps.REQUIRED)
+        self.assertNotEqual(before, after)
+
     def test_changes_with_requirements_file(self):
         a = check_deps.fingerprint("requirements.txt", check_deps.REQUIRED)
         with mock.patch.object(Path, "read_bytes", return_value=b"different"):

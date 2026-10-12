@@ -25,6 +25,7 @@ import imageio.v3 as iio
 from PIL import Image, ImageOps
 
 from . import __version__
+from .gui_export import VideoExportRequest, suggest_video_name
 
 try:
     import tkinterdnd2
@@ -47,7 +48,6 @@ from .gui_helpers import (
     build_reveal_command,
     clamp01,
     clamp_zoom,
-    compute_zoom_view,
     count_saved_video_frames,
     create_split_image,
     draw_zoom_focus_marker,
@@ -63,7 +63,6 @@ from .gui_helpers import (
     terminate_process,
     timeline_index_to_t,
     timeline_t_to_index,
-    venv_python,
 )
 from .gui_job import (
     _CRF_TO_QUALITY,
@@ -71,6 +70,8 @@ from .gui_job import (
     GenerationJob,
     ProgressTracker,
 )
+from .gui_process import read_encode_output, read_generation_output, start_cli_process
+from .gui_viewer import ViewerGeometry
 from .gui_widgets import (
     ACCENT,
     ACCENT_HOVER,
@@ -113,10 +114,8 @@ from .model_data import (
     MODEL_ORDER,
     MODEL_RECOMMENDED,
     VIDEO_EXTENSIONS,
-    build_systematic_video_name,
     filename_stem_error,
     read_video_frames_meta,
-    resolve_name_conflict,
 )
 from .model_data import (
     MODEL_LABELS as MODEL_LABELS_MAP,
@@ -2526,61 +2525,24 @@ class DeepDreamGUI(tk.Tk):
                     job = j
                     break
 
-        frames_dir = self._video_frames_dir
-        meta = read_video_frames_meta(frames_dir) if frames_dir else {}
-
-        source = getattr(job, "image_path", None) or self._video_frames_source or meta.get("source")
-        custom_name = getattr(job, "custom_name", None) or meta.get("custom_name")
-        size = getattr(job, "size", None) if job is not None else meta.get("size")
-        width = meta.get("width")
-        height = meta.get("height")
-        model = getattr(job, "model_key", None) or meta.get("model")
-        layers = getattr(job, "layer_spec", None) or meta.get("layers")
-        iterations = getattr(job, "iterations", None) if job is not None else meta.get("iterations")
-        target_class = getattr(job, "target_class", None) or meta.get("target_class")
-        class_name = meta.get("class_name")
-        guide = getattr(job, "guide_path", None) or meta.get("guide")
-        mode = getattr(job, "mode", None) or self._video_frames_mode or meta.get("mode") or "zoom"
-
-        candidate = build_systematic_video_name(
-            source=source,
-            custom_name=custom_name,
-            size=size,
-            width=width,
-            height=height,
-            model=model,
-            layers=layers,
-            iterations=iterations,
-            target_class=target_class,
-            class_name=class_name,
-            guide=guide,
-            mode=mode,
+        return suggest_video_name(
+            job=job,
+            frames_dir=self._video_frames_dir,
+            source=self._video_frames_source,
+            mode=self._video_frames_mode,
             crf=crf,
+            out_dir=out_dir if out_dir is not None else resolve_out_dir(self._out_dir.get()),
         )
 
-        target_dir = out_dir if out_dir is not None else resolve_out_dir(self._out_dir.get())
-        return resolve_name_conflict(target_dir, candidate)
-
     def _build_encode_cmd(self, frames_dir, out_path, fps, audio_from=None):
-        cmd = [
-            venv_python(),
-            "-m",
-            "app.deepdream",
-            "--encode-frames",
-            frames_dir,
-            "--out",
-            out_path,
-            "--fps",
-            f"{float(fps):.2f}",
-        ]
-        vq_lower = (self._video_quality_var.get() or "").lower()
-        if vq_lower in ("small", "balanced", "lossless"):
-            cmd += ["--video-quality", vq_lower]
-        crf = self._get_current_crf()
-        cmd += ["--crf", str(crf)]
-        if audio_from and os.path.isfile(audio_from):
-            cmd += ["--encode-audio-from", audio_from]
-        return cmd
+        return VideoExportRequest(
+            frames_dir=frames_dir,
+            out_path=out_path,
+            fps=float(fps),
+            quality=self._video_quality_var.get() or "",
+            crf=self._get_current_crf(),
+            audio_from=audio_from,
+        ).build_cmd()
 
     def _on_save_video_click(self):
         if self._video_save_in_progress or not self._has_ready_video_frames():
@@ -2676,20 +2638,7 @@ class DeepDreamGUI(tk.Tk):
 
     def _start_encode_process(self, cmd):
         """Start the encode subprocess. Called on the Tk thread."""
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            encoding="utf-8",
-            errors="backslashreplace",
-            cwd=str(ROOT),
-            creationflags=(
-                getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-            ),
-            start_new_session=(sys.platform != "win32"),
-        )
+        return start_cli_process(cmd, ROOT)
 
     def _run_video_encode(self, cmd, proc, out_path, job_id, count, fps, crf):
         """Worker thread: stream an already-started encode subprocess into the queue.
@@ -2698,22 +2647,7 @@ class DeepDreamGUI(tk.Tk):
         thread by _on_save_video_click so _stop() can always see it; log lines
         and the final result are queued for _poll_log to apply on the Tk thread.
         """
-        rc = -1
-        err_msg = ""
-        try:
-            if proc.stdout:
-                for line in iter(proc.stdout.readline, ""):
-                    if not line:
-                        break
-                    self._encode_queue.put(("line", line, out_path))
-            proc.wait()
-            rc = proc.returncode
-        except OSError as exc:
-            err_msg = f"Error: could not start video export: {exc}\n"
-        except Exception as exc:
-            err_msg = f"Error during video export: {exc}\n"
-        finally:
-            self._encode_queue.put(("done", rc, err_msg, out_path, job_id))
+        read_encode_output(proc, out_path, job_id, self._encode_queue)
 
     def _finish_video_encode(self, rc, log_text, out_path, job_id):
         self._video_save_in_progress = False
@@ -3639,72 +3573,33 @@ class DeepDreamGUI(tk.Tk):
         if src is None:
             return None
         try:
-            sw, sh = src.size
-            lw, lh = self._viewer_label_size()
-            vw, vh = self._get_view_size()
-            # The rendered viewport is exactly (vw, vh) centered in the label.
-            off_x = (lw - vw) // 2
-            off_y = (lh - vh) // 2
-            vx, vy = float(click_x) - off_x, float(click_y) - off_y
-            if not (0 <= vx < vw and 0 <= vy < vh):
-                return None
-            view_w, view_h = vw, vh
-            zoom = self._effective_zoom(src, view_w, view_h)
-            cx, cy = self._ensure_viewer_center(src)
-            view = compute_zoom_view(sw, sh, view_w, view_h, zoom, cx, cy)
-            left, top, right, bottom = view["crop"]
-            dw, dh = view["size"]
-            ox, oy = view["offset"]
-            # Click outside the pasted image (letterbox) maps to nothing.
-            if not (ox <= vx < ox + dw and oy <= vy < oy + dh):
-                return None
-            sx = left + (vx - ox) * (right - left) / max(1, dw)
-            sy = top + (vy - oy) * (bottom - top) / max(1, dh)
-            return (clamp01(sx / sw), clamp01(sy / sh))
+            return self._viewer_geometry(src).normalized_point(click_x, click_y)
         except (TypeError, ValueError, ZeroDivisionError):
             return None
+
+    def _viewer_geometry(self, src):
+        viewport = self._get_view_size()
+        return ViewerGeometry(
+            source_size=src.size,
+            viewport_size=viewport,
+            label_size=self._viewer_label_size(),
+            zoom=self._effective_zoom(src, *viewport),
+            center=self._ensure_viewer_center(src),
+        )
 
     def _zoom_at(self, factor, cursor_x=None, cursor_y=None):
         src = self._get_viewer_source()
         if src is None:
             return
-        sw, sh = src.size
-        vw, vh = self._get_view_size()
-        old_zoom = self._effective_zoom(src, vw, vh)
-        new_zoom = clamp_zoom(old_zoom * factor)
+        geometry = self._viewer_geometry(src)
+        old_zoom = geometry.zoom
+        cursor = (cursor_x, cursor_y) if cursor_x is not None and cursor_y is not None else None
+        try:
+            new_zoom, cx, cy = geometry.zoom_target(factor, cursor)
+        except (TypeError, ValueError, ZeroDivisionError):
+            new_zoom, cx, cy = geometry.zoom_target(factor)
         if abs(new_zoom - old_zoom) < 1e-6:
             return
-        # Zoom toward the cursor: keep the source point under the cursor fixed.
-        cx, cy = self._ensure_viewer_center(src)
-        if cursor_x is not None and cursor_y is not None:
-            try:
-                lw, lh = self._viewer_label_size()
-                off_x = (lw - vw) // 2
-                off_y = (lh - vh) // 2
-                vx, vy = float(cursor_x) - off_x, float(cursor_y) - off_y
-                if 0 <= vx < vw and 0 <= vy < vh:
-                    # Source point currently under the cursor.
-                    view = compute_zoom_view(sw, sh, vw, vh, old_zoom, cx, cy)
-                    left, top, right, bottom = view["crop"]
-                    dw, dh = view["size"]
-                    ox, oy = view["offset"]
-                    if ox <= vx < ox + dw and oy <= vy < oy + dh:
-                        sx = left + (vx - ox) * (right - left) / max(1, dw)
-                        sy = top + (vy - oy) * (bottom - top) / max(1, dh)
-                        # New center so (sx, sy) stays under the cursor.
-                        frac_x = (vx - ox) / max(1, dw) - 0.5
-                        frac_y = (vy - oy) / max(1, dh) - 0.5
-                        vis_w, vis_h = vw / new_zoom, vh / new_zoom
-                        ncx = sx - frac_x * min(sw, vis_w)
-                        ncy = sy - frac_y * min(sh, vis_h)
-                        self._viewer_fit = False
-                        self._viewer_zoom = new_zoom
-                        self._viewer_cx = max(0.0, min(sw, ncx))
-                        self._viewer_cy = max(0.0, min(sh, ncy))
-                        self._render_viewer()
-                        return
-            except (TypeError, ValueError, ZeroDivisionError):
-                pass
         self._viewer_fit = False
         self._viewer_zoom = new_zoom
         self._viewer_cx, self._viewer_cy = cx, cy
@@ -3756,22 +3651,7 @@ class DeepDreamGUI(tk.Tk):
         if src is None:
             return None
         try:
-            sw, sh = src.size
-            lw, lh = self._viewer_label_size()
-            vw, vh = self._get_view_size()
-            off_x = (lw - vw) // 2
-            zoom = self._effective_zoom(src, vw, vh)
-            cx, cy = self._ensure_viewer_center(src)
-            view = compute_zoom_view(sw, sh, vw, vh, zoom, cx, cy)
-            left, top, right, bottom = view["crop"]
-            dw, dh = view["size"]
-            ox, oy = view["offset"]
-            crop_w = max(1, right - left)
-            sx = float(split_ratio) * sw
-            if sx < left or sx > right:
-                return None
-            vx = ox + (sx - left) * dw / crop_w
-            return off_x + vx
+            return self._viewer_geometry(src).split_label_x(split_ratio)
         except (TypeError, ValueError, ZeroDivisionError, AttributeError):
             return None
 
@@ -3780,22 +3660,7 @@ class DeepDreamGUI(tk.Tk):
         if src is None:
             return None
         try:
-            sw, sh = src.size
-            lw, lh = self._viewer_label_size()
-            vw, vh = self._get_view_size()
-            off_x = (lw - vw) // 2
-            vx = float(click_x) - off_x
-            zoom = self._effective_zoom(src, vw, vh)
-            cx, cy = self._ensure_viewer_center(src)
-            view = compute_zoom_view(sw, sh, vw, vh, zoom, cx, cy)
-            left, top, right, bottom = view["crop"]
-            dw, dh = view["size"]
-            ox, oy = view["offset"]
-            if dw <= 0 or sw <= 0:
-                return 0.5
-            clamped_vx = max(ox, min(ox + dw, vx))
-            sx = left + (clamped_vx - ox) * (right - left) / max(1, dw)
-            return clamp01(sx / sw)
+            return self._viewer_geometry(src).split_ratio(click_x)
         except (TypeError, ValueError, ZeroDivisionError, AttributeError):
             return 0.5
 
@@ -4866,22 +4731,7 @@ class DeepDreamGUI(tk.Tk):
             self._frames_preexisting = False
 
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                encoding="utf-8",
-                errors="backslashreplace",
-                cwd=str(ROOT),
-                creationflags=(
-                    getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-                ),
-                # Own process group on POSIX so terminate_process() can
-                # signal the whole tree (deepdream + short-lived ffmpeg).
-                start_new_session=(sys.platform != "win32"),
-            )
+            proc = start_cli_process(cmd, ROOT)
         except OSError as exc:
             self._log_msg(
                 f"\nFailed to start deepdream for Job #{job.id}: {exc}\n", color=ERROR_COL
@@ -4944,19 +4794,7 @@ class DeepDreamGUI(tk.Tk):
         """Background thread: read subprocess output into the log queue.
         Binds to its own proc and on exit pushes that process's id in the
         completion marker, so a newer run is never blamed (PROC_DONE_PREFIX)."""
-        try:
-            for line in proc.stdout:
-                self._log_queue.put(line)
-        finally:
-            try:
-                if proc.stdout:
-                    proc.stdout.close()
-            except OSError:
-                pass
-            try:
-                proc.wait()
-            finally:
-                self._log_queue.put(f"{PROC_DONE_PREFIX}{id(proc)}:{getattr(job, 'id', 0)}")
+        read_generation_output(proc, getattr(job, "id", 0), self._log_queue)
 
     def _ensure_poll(self):
         """(Re)start the periodic drain if it is not already scheduled."""

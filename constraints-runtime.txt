@@ -1,0 +1,10 @@
+# Tested direct-runtime baseline. This is not a full transitive lockfile.
+# Public torch versions also accept the matching +cpu / +cu128 wheels.
+# Update torch and torchvision together, then run the CI matrix and packaging checks.
+torch==2.11.0
+torchvision==0.26.0
+numpy==2.4.4
+pillow==12.2.0
+tkinterdnd2==0.6.2
+imageio==2.37.4
+imageio-ffmpeg==0.6.0

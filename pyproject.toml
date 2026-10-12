@@ -28,7 +28,8 @@ classifiers = [
   "Topic :: Artistic Software",
   "Topic :: Multimedia :: Graphics",
 ]
-# Mirrors requirements.txt; the CUDA build is pinned in requirements-cuda.txt.
+# Compatibility floors mirror requirements.txt. Source/launcher installs use
+# constraints-runtime.txt; CUDA wheel selection lives in requirements-cuda.txt.
 # tkinter is part of the Python distribution and cannot be declared here.
 dependencies = [
   "torch>=2.4.1",
