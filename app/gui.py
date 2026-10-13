@@ -113,7 +113,7 @@ from .model_data import (
     layer_value_map,
     read_video_frames_meta,
 )
-from .protocol import EV_DONE, EV_PREVIEW, parse_event
+from .protocol import EV_DONE, EV_PID, EV_PREVIEW, parse_event
 
 __all__ = ["DeepDreamGUI", "main"]
 
@@ -380,6 +380,9 @@ class DeepDreamGUI(
         self._is_closing = False
         self._reported_callback_errors: set = set()
         self._proc = None
+        # Temp-file pid that each generation child announced, keyed by process.
+        self._proc_pids: dict[int, int | None] = {}
+        self._proc_reader_threads: dict[int, threading.Thread] = {}
         self._poll_after_id = None
         self._next_job_after_id = None
         self._log_queue: queue.Queue[str] = queue.Queue()
@@ -466,8 +469,12 @@ class DeepDreamGUI(
             proc_ref = self._proc
             encode_proc_ref = encode_proc
             job_ref = job
-            pid_ref = getattr(proc_ref, "pid", None)
-            encode_pid = getattr(encode_proc_ref, "pid", None)
+            pid_ref = self._proc_pids.get(id(proc_ref))
+            reader_ref = self._proc_reader_threads.get(id(proc_ref))
+            encode_reader_ref = self._encode_reader_thread
+            # The encoder reports its own pid; its process handle can be a venv launcher.
+            export_target = self._video_export_target
+            export_dir = os.path.dirname(export_target) if export_target else None
 
             def _reap():
                 for p in (proc_ref, encode_proc_ref):
@@ -480,16 +487,24 @@ class DeepDreamGUI(
                                 p.wait(timeout=2.0)
                             except subprocess.TimeoutExpired:
                                 pass
+                if reader_ref is not None:
+                    reader_ref.join()
+                if encode_reader_ref is not None:
+                    encode_reader_ref.join()
+                cleanup_pid = self._proc_pids.get(id(proc_ref), pid_ref)
+                encode_pid = self._video_export_pid
                 # Sweep only after the child is reaped, otherwise it can
                 # recreate a partial frame/temp after the cleanup runs.
                 # _cleanup_partial_frames() (and its _log_msg calls)
                 # short-circuits on _is_closing, so this is safe after destroy().
                 self._cleanup_partial_frames()
                 if job_ref is not None:
-                    self._cleanup_job_temps(job_ref.out_dir, pid_ref)
+                    self._cleanup_job_temps(job_ref.out_dir, cleanup_pid)
                 vfd = self._video_frames_dir
-                if encode_pid is not None and vfd:
-                    self._cleanup_job_temps(os.path.dirname(vfd), encode_pid)
+                if encode_pid is not None:
+                    if vfd:
+                        self._cleanup_job_temps(os.path.dirname(vfd), encode_pid)
+                    self._cleanup_job_temps(export_dir, encode_pid)
 
             t = threading.Thread(target=_reap, daemon=True)
             t.start()
@@ -3157,8 +3172,13 @@ class DeepDreamGUI(
             return
 
         self._proc = proc
+        # Sweep under the handle's pid until the child announces its own.
+        handle_pid = getattr(proc, "pid", None)
+        self._proc_pids[id(proc)] = handle_pid if isinstance(handle_pid, int) else None
         self._ensure_poll()
-        threading.Thread(target=self._reader, daemon=True, args=(proc, job)).start()
+        reader = threading.Thread(target=self._reader, daemon=True, args=(proc, job))
+        self._proc_reader_threads[id(proc)] = reader
+        reader.start()
 
     def _stop(self):
         self._queue_running = False
@@ -3174,6 +3194,7 @@ class DeepDreamGUI(
             self._log_msg("\n[Queue stopped by user]\n", color=WARNING)
             stopped_child = True
         if encode_proc and encode_proc.poll() is None:
+            self._video_export_cancelled = True
             terminate_process(encode_proc)
             self._log_msg("\n[Video export stopped by user]\n", color=WARNING)
             stopped_child = True
@@ -3204,7 +3225,15 @@ class DeepDreamGUI(
         """Background thread: read subprocess output into the log queue.
         Binds to its own proc and on exit pushes that process's id in the
         completion marker, so a newer run is never blamed (PROC_DONE_PREFIX)."""
-        read_generation_output(proc, getattr(job, "id", 0), self._log_queue)
+
+        def record_pid(line):
+            event = parse_event(line)
+            if event is not None and event.get("event") == EV_PID:
+                pid = event.get("pid")
+                if isinstance(pid, int):
+                    self._proc_pids[id(proc)] = pid
+
+        read_generation_output(proc, getattr(job, "id", 0), self._log_queue, on_line=record_pid)
 
     def _ensure_poll(self):
         """(Re)start the periodic drain if it is not already scheduled."""
@@ -3255,6 +3284,13 @@ class DeepDreamGUI(
                     except (ValueError, IndexError):
                         job_id = None
                     self._mark_stale_job_stopped(job_id)
+                    # The stale child is reaped, so sweep the temp files it left.
+                    stale_pid = self._proc_pids.pop(proc_id, None)
+                    self._proc_reader_threads.pop(proc_id, None)
+                    for j in self._job_queue:
+                        if j.id == job_id:
+                            self._cleanup_job_temps(j.out_dir, stale_pid)
+                            break
                     curr_job_id = getattr(self._current_job, "id", None)
                     if curr_job_id is None or curr_job_id not in self._aborted_jobs:
                         self._aborted = False
@@ -3308,6 +3344,13 @@ class DeepDreamGUI(
         still emitted alongside these, so the log stays complete.
         """
         kind = event.get("event")
+        if kind == EV_PID:
+            # Names this child's temp files. Its process handle can be a venv
+            # launcher, so the sweep must use the pid the child reports.
+            pid = event.get("pid")
+            if isinstance(pid, int) and self._proc is not None:
+                self._proc_pids[id(self._proc)] = pid
+            return False
         if kind == EV_PREVIEW:
             return True
         if kind == EV_DONE:
@@ -3378,6 +3421,9 @@ class DeepDreamGUI(
         """Handle the subprocess-exit sentinel."""
         rc = self._proc.returncode if self._proc else -1
         job = self._current_job
+        proc_id = id(self._proc)
+        finished_pid = self._proc_pids.pop(proc_id, None)
+        self._proc_reader_threads.pop(proc_id, None)
         is_aborted = self._aborted or (job is not None and job.id in self._aborted_jobs)
         if is_aborted and rc == 0:
             # Stop raced a run that had already completed successfully: the
@@ -3414,7 +3460,7 @@ class DeepDreamGUI(
         if job is not None:
             # Kill-style exits (Stop / close) skip deepdream.py's own temp
             # cleanup, so sweep them here now that the child is reaped.
-            self._cleanup_job_temps(job.out_dir, getattr(self._proc, "pid", None))
+            self._cleanup_job_temps(job.out_dir, finished_pid)
             self._aborted_jobs.discard(job.id)
         self._aborted = bool(self._aborted_jobs)
         self._proc = None

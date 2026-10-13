@@ -128,6 +128,7 @@ def test_stop_terminates_generation_and_export_without_starting_next_job() -> No
     assert not window._queue_running
     assert window._aborted
     assert window._aborted_jobs == {9}
+    assert window._video_export_cancelled
     window._cancel_next_job_timer.assert_called_once_with()
     window._process_next_job.assert_not_called()
 
@@ -149,6 +150,25 @@ def test_close_cancels_timers_and_reaps_both_children_before_cleanup() -> None:
     window._video_frames_dir = "output/frames"
     window._slider_registry = []
     window._video_loader = mock.Mock()
+    window._video_export_pid = export.pid
+    window._video_export_target = "export/clip.mp4"
+    window._proc_pids = {id(generation): generation.pid}
+    reader = mock.Mock()
+
+    def finish_reader(**kw: object) -> None:
+        order.append("reader joined")
+        window._proc_pids[id(generation)] = 303
+
+    reader.join.side_effect = finish_reader
+    window._proc_reader_threads = {id(generation): reader}
+    encode_reader = mock.Mock()
+
+    def finish_encode_reader(**kw: object) -> None:
+        order.append("encode reader joined")
+        window._video_export_pid = 606
+
+    encode_reader.join.side_effect = finish_encode_reader
+    window._encode_reader_thread = encode_reader
     window._cleanup_partial_frames.side_effect = lambda: order.append("frames cleaned")
 
     def immediate_thread(*, target: Callable[[], None], daemon: bool) -> mock.Mock:
@@ -161,7 +181,13 @@ def test_close_cancels_timers_and_reaps_both_children_before_cleanup() -> None:
         mock.patch.object(gui.threading, "Thread", side_effect=immediate_thread),
     ):
         gui.DeepDreamGUI._on_close(window)
-    assert order == ["generation reaped", "export reaped", "frames cleaned"]
+    assert order == [
+        "generation reaped",
+        "export reaped",
+        "reader joined",
+        "encode reader joined",
+        "frames cleaned",
+    ]
     assert terminate.call_args_list == [mock.call(generation), mock.call(export)]
     assert window.after_cancel.call_args_list == [mock.call("log-poll"), mock.call("video-poll")]
     window._stop_video_playback.assert_called_once_with()
@@ -171,3 +197,8 @@ def test_close_cancels_timers_and_reaps_both_children_before_cleanup() -> None:
     assert window._is_closing
     assert window._poll_after_id is None
     assert window._video_poll_after_id is None
+    window._cleanup_job_temps.assert_any_call("output", 606)
+    window._cleanup_job_temps.assert_any_call("export", 606)
+    window._cleanup_job_temps.assert_any_call("output", 303)
+    reader.join.assert_called_once_with()
+    encode_reader.join.assert_called_once_with()

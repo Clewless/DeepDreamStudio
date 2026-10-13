@@ -84,9 +84,11 @@ from .models import _forward_googlenet as _forward_googlenet
 from .models import build_googlenet as build_googlenet
 from .protocol import (
     EV_DONE,
+    EV_ERROR,
     EV_FRAME,
     EV_ITERATION,
     EV_OCTAVE,
+    EV_PID,
     EV_PREVIEW,
     EV_STATUS,
     format_event,
@@ -1284,6 +1286,11 @@ def _encode_png_sequence(files, out_path, fps=30, crf=17, preset="medium", what=
                 pct = int(idx / total_frames * 100)
                 print(f"Encoding frame {idx}/{total_frames} ({pct}%)", flush=True)
                 emit_event(EV_FRAME, current=idx, total=total_frames)
+        except Exception:
+            # Announce before writer.close(), which can wait on ffmpeg. A Stop
+            # during that wait must not hide the failure.
+            emit_event(EV_ERROR)
+            raise
         finally:
             writer.close()
         # Caller atomically moves temp_out to the real path (possibly via an
@@ -2487,12 +2494,27 @@ def _execute_image_plan(
             )
 
 
+def _run_encode_frames_cli(args: argparse.Namespace) -> None:
+    """Run --encode-frames, announcing a failure on the event stream before it propagates."""
+    try:
+        _resolve_and_validate_args(args)
+    except (SystemExit, Exception):
+        emit_event(EV_ERROR)
+        raise
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point for the DeepDream CLI."""
     _configure_streams()
     check_runtime_environment()
     ap = build_cli_parser()
     args = ap.parse_args(argv)
+    # Temp files are named with this pid. The GUI's handle to the process can be
+    # a venv launcher with another pid, so the GUI finds them through this one.
+    emit_event(EV_PID, pid=os.getpid())
+    if args.encode_frames:
+        _run_encode_frames_cli(args)
+        return
 
     resolved = _resolve_and_validate_args(args)
     if resolved is None:

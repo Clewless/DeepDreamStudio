@@ -10,6 +10,7 @@ from __future__ import annotations
 import queue
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from .gui_helpers import PROC_DONE_PREFIX
@@ -34,12 +35,21 @@ def start_cli_process(cmd: list[str], cwd: str | Path) -> subprocess.Popen[str]:
 
 
 def read_generation_output(
-    proc: subprocess.Popen[str], job_id: int, messages: queue.Queue[str]
+    proc: subprocess.Popen[str],
+    job_id: int,
+    messages: queue.Queue[str],
+    on_line: Callable[[str], None] | None = None,
 ) -> None:
-    """Stream generation output and always publish an identity-bound completion."""
+    """Stream output, optionally observe each line, and publish completion.
+
+    ``on_line`` runs on the reader thread before the line is added to the UI
+    queue, so callers can capture process-local state even if UI polling stops.
+    """
     try:
         if proc.stdout is not None:
             for line in proc.stdout:
+                if on_line is not None:
+                    on_line(line)
                 messages.put(line)
     finally:
         try:
@@ -54,14 +64,24 @@ def read_generation_output(
 
 
 def read_encode_output(
-    proc: subprocess.Popen[str], out_path: str, job_id: int | None, messages: queue.Queue[tuple]
+    proc: subprocess.Popen[str],
+    out_path: str,
+    job_id: int | None,
+    messages: queue.Queue[tuple],
+    on_line: Callable[[str], None] | None = None,
 ) -> None:
-    """Stream export output into UI messages; no worker touches Tk state."""
+    """Stream export output, optionally observe lines, and publish completion.
+
+    ``on_line`` runs on the reader thread before the line is added to the UI
+    queue, so callers can capture process-local state even if UI polling stops.
+    """
     rc = -1
     error = ""
     try:
         if proc.stdout is not None:
             for line in iter(proc.stdout.readline, ""):
+                if on_line is not None:
+                    on_line(line)
                 messages.put(("line", line, out_path))
         proc.wait()
         rc = proc.returncode

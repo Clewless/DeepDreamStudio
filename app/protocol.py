@@ -26,6 +26,12 @@ EV_FRAME = "frame"
 EV_PREVIEW = "preview"
 EV_DONE = "done"
 EV_STATUS = "status"
+# This process's own pid, announced first on every run. The GUI's process handle
+# can be a venv launcher, so temp files named with this pid are found through it.
+EV_PID = "pid"
+# A failed encode, sent as soon as the failure is raised, before the writer is
+# closed, so a Stop during that close still sees it. It may repeat at exit.
+EV_ERROR = "error"
 
 
 def format_event(event: str, **fields: Any) -> str:

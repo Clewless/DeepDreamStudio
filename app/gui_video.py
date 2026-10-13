@@ -36,7 +36,7 @@ from .gui_widgets import (
     ModernSegmentedButton,
     Tooltip,
 )
-from .protocol import parse_event
+from .protocol import EV_ERROR, EV_PID, parse_event
 
 
 class VideoExportMixin:
@@ -47,6 +47,7 @@ class VideoExportMixin:
     _setup_mp4_preview: Callable[..., Any]
     _ensure_poll: Callable[..., Any]
     _stop_video_playback: Callable[..., Any]
+    _cleanup_job_temps: Callable[..., Any]
     _slider: Callable[..., Any]
 
     # Shared window state.
@@ -92,6 +93,11 @@ class VideoExportMixin:
     _video_save_in_progress: bool
     _video_export_target: str | None
     _video_export_request: VideoExportRequest | None
+    _video_export_cancelled: bool
+    _video_export_failed: bool
+    _video_export_pid: int | None
+    _video_export_prev_title: str | None
+    _encode_reader_thread: threading.Thread | None
     _video_last_save: str | None
     _video_last_crf: int | None
 
@@ -121,6 +127,17 @@ class VideoExportMixin:
         self._video_save_in_progress = False
         self._video_export_target = None
         self._video_export_request = None
+        # Set by _stop() when the user terminates a running encode; consumed by
+        # _finish_video_encode so cancellation is not reported as a failure.
+        self._video_export_cancelled = False
+        # Reported by the encode child: whether it announced a failure, and its
+        # own pid (the process handle can be a venv launcher).
+        self._video_export_failed = False
+        self._video_export_pid = None
+        self._encode_reader_thread = None
+        # Preview header replaced by "Encoding Video -> ..."; put back when the
+        # export does not produce a preview.
+        self._video_export_prev_title = None
         self._video_last_save = None
         self._video_last_crf = None
 
@@ -405,7 +422,11 @@ class VideoExportMixin:
         self._progress.set(0)
         self._status_label.configure(text="Encoding video...", text_color=WARNING)
         self._stop_video_playback()
+        self._video_export_failed = False
+        self._video_export_pid = None
+        self._video_export_prev_title = None
         try:
+            self._video_export_prev_title = self._preview_title.cget("text")
             self._preview_title.configure(text=f"Encoding Video -> {Path(path).name}...")
         except tk.TclError:
             pass
@@ -423,17 +444,25 @@ class VideoExportMixin:
             return
         # Started on the Tk thread so _stop() can never miss the process.
         self._encode_proc = proc
+        # Sweep under the handle's pid until the encoder announces its own.
+        handle_pid = getattr(proc, "pid", None)
+        self._video_export_pid = handle_pid if isinstance(handle_pid, int) else None
         self._ensure_poll()
-        threading.Thread(
+        reader = threading.Thread(
             target=self._run_video_encode,
             daemon=True,
             args=(cmd, proc, path, job_id, count, fps, crf),
-        ).start()
+        )
+        self._encode_reader_thread = reader
+        reader.start()
 
     def _handle_encode_line(self, line, out_path):
+        event = parse_event(line)
+        if event is not None:
+            self._record_encode_event(event)
         if self._is_closing:
             return
-        if parse_event(line) is None:
+        if event is None:
             self._log_msg(line)
         frac, status = self._tracker.update(line)
         if frac is not None:
@@ -454,6 +483,15 @@ class VideoExportMixin:
             self._status_label.configure(text="Video saved ✓", text_color=SUCCESS)
             self._progress.set(1.0)
 
+    def _record_encode_event(self, event):
+        """Keep what the encode child announced about itself until the export ends."""
+        kind = event.get("event")
+        if kind == EV_PID:
+            pid = event.get("pid")
+            self._video_export_pid = pid if isinstance(pid, int) else None
+        elif kind == EV_ERROR:
+            self._video_export_failed = True
+
     def _start_encode_process(self, cmd):
         """Start the encode subprocess. Called on the Tk thread."""
         return start_cli_process(cmd, ROOT)
@@ -465,15 +503,30 @@ class VideoExportMixin:
         thread by _on_save_video_click so _stop() can always see it; log lines
         and the final result are queued for _poll_log to apply on the Tk thread.
         """
-        read_encode_output(proc, out_path, job_id, self._encode_queue)
+
+        def record_event(line):
+            event = parse_event(line)
+            if event is not None:
+                self._record_encode_event(event)
+
+        read_encode_output(proc, out_path, job_id, self._encode_queue, on_line=record_event)
 
     def _finish_video_encode(self, rc, log_text, out_path, job_id):
         request = self._video_export_request
         self._video_export_request = None
+        cancelled = self._video_export_cancelled
+        self._video_export_cancelled = False
+        failed = self._video_export_failed
+        self._video_export_failed = False
+        encode_pid = self._video_export_pid
+        self._video_export_pid = None
+        prev_title = self._video_export_prev_title
+        self._video_export_prev_title = None
         self._video_save_in_progress = False
         self._video_export_target = None
         # Cleared on the Tk thread so _stop() never races the worker's assignment.
         self._encode_proc = None
+        self._encode_reader_thread = None
         if not self._queue_running and self._proc is None:
             self._stop_btn.configure(state="disabled", text_color=TEXT_DIM)
         if self._is_closing:
@@ -516,15 +569,29 @@ class VideoExportMixin:
         else:
             self._output_path = None
             self._progress.set(0)
-            self._status_label.configure(text="Export failed", text_color=ERROR_COL)
-            self._log_msg("\nVideo export failed. See the log above.\n", color=ERROR_COL)
-            try:
-                messagebox.showerror(
-                    "Video Export Failed",
-                    "Could not export the video.\nSee the console log for details.",
-                )
-            except tk.TclError:
-                pass
+            # A killed encoder runs no cleanup, and a failed one may have been
+            # killed mid-write: remove the temp files it left in the export folder.
+            self._cleanup_job_temps(os.path.dirname(out_path), encode_pid)
+            if prev_title is not None:
+                # The export produced no preview, so restore the header it replaced.
+                try:
+                    self._preview_title.configure(text=prev_title)
+                except tk.TclError:
+                    pass
+            if cancelled and not failed:
+                # _stop() terminated a healthy encode and already logged it. A
+                # failure the encoder announced before Stop is still a failure.
+                self._status_label.configure(text="Stopped", text_color=WARNING)
+            else:
+                self._status_label.configure(text="Export failed", text_color=ERROR_COL)
+                self._log_msg("\nVideo export failed. See the log above.\n", color=ERROR_COL)
+                try:
+                    messagebox.showerror(
+                        "Video Export Failed",
+                        "Could not export the video.\nSee the console log for details.",
+                    )
+                except tk.TclError:
+                    pass
         self._refresh_video_save_ui()
 
     def _on_timelapse_toggle(self):

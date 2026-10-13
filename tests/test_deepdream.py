@@ -21,6 +21,7 @@ import torchvision.models as models
 from PIL import Image
 
 import app.deepdream as deepdream
+from app.protocol import EV_ERROR, EV_PID, format_event
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -58,6 +59,38 @@ def run_cli(args: list[str]) -> CliResult:
             if isinstance(exc.code, str) and exc.code.strip():
                 buf_err.write(exc.code + "\n")
     return CliResult(code, buf_out.getvalue(), buf_err.getvalue())
+
+
+class TestEncodeFailureAnnouncement(unittest.TestCase):
+    def test_failure_is_announced_before_the_writer_is_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            files = []
+            for i in range(3):
+                path = os.path.join(d, f"frame_{i:06d}.png")
+                Image.new("RGB", (16, 16)).save(path)
+                files.append(path)
+            stdout = io.StringIO()
+            announced_at_close: list[bool] = []
+
+            class FailingWriter:
+                def __init__(self):
+                    self.frames = 0
+
+                def append_data(self, _frame):
+                    self.frames += 1
+                    if self.frames == 2:
+                        raise OSError("disk full")
+
+                def close(self):
+                    announced_at_close.append(format_event(EV_ERROR) in stdout.getvalue())
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(deepdream, "_open_video_writer", return_value=FailingWriter()),
+                self.assertRaises(OSError),
+            ):
+                deepdream._encode_png_sequence(files, os.path.join(d, "out.mp4"))
+            self.assertEqual(announced_at_close, [True])
 
 
 class TestDeepDream(unittest.TestCase):
@@ -1646,6 +1679,19 @@ class TestGuidedAndVideoFeatures(unittest.TestCase):
         res = run_cli(["--encode-frames", "somedir", "--zoom", self.sample_img_path])
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("--encode-frames cannot be combined", res.stderr)
+
+    def test_encode_frames_cli_reports_pid_and_failure_events(self):
+        res = run_cli(["--encode-frames", "somedir", "--out", "out.mp4"])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn(format_event(EV_PID, pid=os.getpid()), res.stdout)
+        self.assertIn(format_event(EV_ERROR), res.stdout)
+        self.assertIn("frames directory 'somedir' does not exist", res.stderr)
+
+    def test_generation_cli_announces_its_pid_before_failing(self):
+        res = run_cli(["missing_image.png"])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn(format_event(EV_PID, pid=os.getpid()), res.stdout)
+        self.assertIn("Input image not found", res.stderr)
 
     def test_frames_only_cli_requires_zoom_or_video(self):
         res = run_cli([self.sample_img_path, "--frames-only"])

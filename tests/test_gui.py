@@ -51,9 +51,11 @@ from app.model_data import (
 )
 from app.protocol import (
     EV_DONE,
+    EV_ERROR,
     EV_FRAME,
     EV_ITERATION,
     EV_OCTAVE,
+    EV_PID,
     EV_PREVIEW,
     EVENT_PREFIX,
     format_event,
@@ -1310,6 +1312,112 @@ class TestJobCleanup(unittest.TestCase):
         self.app._cleanup_job_temps("no/such/dir", 123)  # must not raise
         self.app._cleanup_job_temps("", None)
 
+    def test_finished_generation_sweeps_temps_under_the_pid_it_reported(self):
+        # The child names its temp files with its own pid, which differs from the
+        # process handle's pid when the venv python is a launcher.
+        with tempfile.TemporaryDirectory() as d:
+            job = self._job(id=7, out_dir=d)
+            self.app._job_queue = [job]
+            self.app._current_job = job
+            proc = mock.Mock(pid=111, returncode=1)
+            proc.poll.return_value = 1
+            self.app._proc = proc
+            doomed = os.path.join(d, "x.png.p4242.tmp")
+            kept = os.path.join(d, "y.png.p111.tmp")
+            for path in (doomed, kept):
+                Path(path).write_bytes(b"partial")
+            self.app._log_queue.put(format_event(EV_PID, pid=4242) + "\n")
+            self.app._log_queue.put(f"{PROC_DONE_PREFIX}{id(proc)}:{job.id}")
+            self.app._poll_log()
+            self.assertFalse(os.path.exists(doomed))
+            self.assertTrue(os.path.exists(kept))
+            self.assertIsNone(self.app._proc)
+            self.assertEqual(self.app._proc_pids, {})
+
+    def test_stale_generation_exit_sweeps_temps_under_its_own_pid(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_dir = os.path.join(d, "old")
+            new_dir = os.path.join(d, "new")
+            os.makedirs(old_dir)
+            os.makedirs(new_dir)
+            old_job = self._job(id=1, out_dir=old_dir)
+            new_job = self._job(id=2, out_dir=new_dir)
+            self.app._job_queue = [old_job, new_job]
+            stale = mock.Mock(pid=111, returncode=1)
+            current = mock.Mock(pid=222, returncode=None)
+            current.poll.return_value = None
+            self.app._proc = current
+            self.app._current_job = new_job
+            self.app._proc_pids = {id(stale): 4242}
+            doomed = os.path.join(old_dir, "x.png.p4242.tmp")
+            Path(doomed).write_bytes(b"partial")
+            # The stale child exited after Stop, and the next job already started.
+            self.app._log_queue.put(f"{PROC_DONE_PREFIX}{id(stale)}:{old_job.id}")
+            self.app._poll_log()
+            self.assertFalse(os.path.exists(doomed))
+            self.assertIs(self.app._proc, current)
+            self.assertEqual(self.app._proc_pids, {})
+
+    def _poll_until(self, done, timeout=120.0):
+        """Apply queued generation output on this thread until *done()* holds."""
+        deadline = time.monotonic() + timeout
+        while not done():
+            if time.monotonic() > deadline:
+                self.fail("timed out waiting for the generation subprocess")
+            self.app._poll_log()
+            time.sleep(0.02)
+
+    def test_generation_without_pid_event_sweeps_under_the_handle_pid(self):
+        with tempfile.TemporaryDirectory() as d:
+            job = self._job(id=3, out_dir=d)
+            self.app._job_queue = [job]
+            self.app._current_job = job
+            proc = mock.Mock(pid=4242, returncode=1)
+            proc.poll.return_value = 1
+            with (
+                mock.patch.object(gui, "start_cli_process", return_value=proc),
+                mock.patch.object(self.app, "_reader"),
+            ):
+                self.app._execute_job(job)
+            doomed = os.path.join(d, "x.png.p4242.tmp")
+            Path(doomed).write_bytes(b"partial")
+            self.app._on_process_finished()
+            self.assertFalse(os.path.exists(doomed))
+
+    @pytest.mark.integration
+    def test_real_generation_stop_sweeps_temps_under_the_reported_pid(self):
+        # A real generation child, stopped through the GUI's own path. Its temp files
+        # carry the pid it reports, which can differ from the process handle's pid.
+        import torch
+        from PIL import Image
+
+        weights = os.path.join(torch.hub.get_dir(), "checkpoints", "googlenet-1378be20.pth")
+        if not os.path.isfile(weights):
+            self.skipTest("googlenet weights are not cached; the real generation check needs them")
+        self.addCleanup(_kill_leftover_children, self.app)
+        with tempfile.TemporaryDirectory() as d:
+            image = os.path.join(d, "in.png")
+            Image.new("RGB", (64, 64), color=(90, 120, 150)).save(image)
+            out_dir = os.path.join(d, "out")
+            os.makedirs(out_dir)
+            job = self._job(id=7, out_dir=out_dir, image_path=image, iterations=50, size=256)
+            self.app._job_queue = [job]
+            self.app._current_job = job
+            self.app._execute_job(job)
+            proc = self.app._proc
+            # One iteration has run, so the child's pid event has been applied.
+            self._poll_until(lambda: self.app._progress.get() > 0)
+            reported = self.app._proc_pids[id(proc)]
+            doomed = os.path.join(out_dir, f"x.png.p{reported}.tmp")
+            kept = os.path.join(out_dir, "y.png.p999999.tmp")
+            for path in (doomed, kept):
+                Path(path).write_bytes(b"partial")
+            self.app._stop()
+            self._poll_until(lambda: self.app._proc is None)
+            self.assertFalse(os.path.exists(doomed))
+            self.assertTrue(os.path.exists(kept))
+            self.assertEqual(self.app._status_label.cget("text"), "Stopped")
+
     def test_cleanup_partial_frames_removes_fresh_dir(self):
         with tempfile.TemporaryDirectory() as d:
             frames = os.path.join(d, "frames")
@@ -1863,6 +1971,13 @@ class TestSavedVideoFramesHelpers(unittest.TestCase):
         self.assertNotIn("--clear-frames", cmd)
 
 
+def _kill_leftover_children(app):
+    """Stop an encode or generation child that a failed real-process test left running."""
+    for proc in (getattr(app, "_encode_proc", None), getattr(app, "_proc", None)):
+        if proc is not None and proc.poll() is None:
+            terminate_process(proc, force=True)
+
+
 @pytest.mark.gui
 class TestVideoExport(unittest.TestCase):
     def setUp(self):
@@ -1894,20 +2009,20 @@ class TestVideoExport(unittest.TestCase):
         self.app._poll_video_loader()
 
     @staticmethod
-    def _make_frames(d, n=4, fps=24, mode="zoom", source=None, job_id=1):
+    def _make_frames(d, n=4, fps=24, mode="zoom", source=None, job_id=1, size=(64, 48)):
         from PIL import Image
 
         fd = os.path.join(d, f"frames_job{job_id}_p1")
         os.makedirs(fd, exist_ok=True)
         for i in range(1, n + 1):
-            Image.new("RGB", (64, 48), color=(i * 40, 100, 150)).save(
+            Image.new("RGB", size, color=(i * 40, 100, 150)).save(
                 os.path.join(fd, f"frame_{i:06d}.png")
             )
         with open(os.path.join(fd, "meta.json"), "w", encoding="utf-8") as fh:
             import json
 
             json.dump(
-                {"mode": mode, "fps": fps, "source": source, "width": 64, "height": 48},
+                {"mode": mode, "fps": fps, "source": source, "width": size[0], "height": size[1]},
                 fh,
             )
         return fd
@@ -1940,11 +2055,13 @@ class TestVideoExport(unittest.TestCase):
         self._settle_video_loader()
         return job, fd
 
-    def _save_video_command(self, out_mp4):
+    def _save_video_command(self, out_mp4, pid=None):
         worker_called = threading.Event()
         with (
             mock.patch("tkinter.filedialog.asksaveasfilename", return_value=out_mp4),
-            mock.patch.object(self.app, "_start_encode_process", return_value=mock.Mock()) as start,
+            mock.patch.object(
+                self.app, "_start_encode_process", return_value=mock.Mock(pid=pid)
+            ) as start,
             mock.patch.object(
                 self.app,
                 "_run_video_encode",
@@ -2015,6 +2132,7 @@ class TestVideoExport(unittest.TestCase):
             _job, frames_dir = self._ready_job(d)
             existing_frames = set(Path(frames_dir).iterdir())
             out_mp4 = os.path.join(d, "stopped.mp4")
+            self.app._preview_title.configure(text="Dream Result")
             self._save_video_command(out_mp4)
             proc = self.app._encode_proc
             proc.poll.return_value = None
@@ -2024,14 +2142,159 @@ class TestVideoExport(unittest.TestCase):
             # Completion remains owned by the queue, not the Stop handler.
             self.assertIs(self.app._encode_proc, proc)
             self.assertIsNotNone(self.app._video_export_request)
+            self.assertTrue(self.app._video_export_cancelled)
             self.app._encode_queue.put(("done", 1, "cancelled", out_mp4, 1))
-            with mock.patch.object(gui.messagebox, "showerror"):
+            with mock.patch.object(gui.messagebox, "showerror") as err:
                 self.app._drain_encode_queue()
+            # A user-stopped encode reports "Stopped", not a failure dialog.
+            err.assert_not_called()
+            self.assertEqual(self.app._status_label.cget("text"), "Stopped")
+            self.assertEqual(self.app._preview_title.cget("text"), "Dream Result")
+            self.assertFalse(self.app._video_export_cancelled)
             self.assertIsNone(self.app._video_export_request)
             self.assertIsNone(self.app._encode_proc)
             self.assertFalse(self.app._video_save_in_progress)
             self.assertEqual(set(Path(frames_dir).iterdir()), existing_frames)
             self.assertTrue(self.app._has_ready_video_frames())
+
+    def test_stop_removes_partial_temp_files_of_the_stopped_encoder(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._ready_job(d)
+            out_mp4 = os.path.join(d, "stopped.mp4")
+            self._save_video_command(out_mp4)
+            proc = self.app._encode_proc
+            proc.poll.return_value = None
+            partial = os.path.join(d, "stopped.mp4.p4242.temp.mp4")
+            other = os.path.join(d, "stopped.mp4.p4343.temp.mp4")
+            for path in (partial, other):
+                Path(path).write_bytes(b"partial")
+            self.app._encode_queue.put(("line", format_event(EV_PID, pid=4242) + "\n", out_mp4))
+            with mock.patch.object(gui, "terminate_process") as terminate:
+                self.app._stop()
+            terminate.assert_called_once_with(proc)
+            self.app._encode_queue.put(("done", 1, "", out_mp4, 1))
+            with mock.patch.object(gui.messagebox, "showerror") as err:
+                self.app._drain_encode_queue()
+            err.assert_not_called()
+            self.assertEqual(self.app._status_label.cget("text"), "Stopped")
+            self.assertFalse(os.path.exists(partial))
+            self.assertTrue(os.path.exists(other))
+            self.assertTrue(self.app._has_ready_video_frames())
+
+    def test_failure_announced_before_stop_is_reported_as_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._ready_job(d)
+            self.app._preview_title.configure(text="Dream Result")
+            out_mp4 = os.path.join(d, "announced.mp4")
+            self._save_video_command(out_mp4)
+            proc = self.app._encode_proc
+            proc.poll.return_value = None
+            # The encoder announced its failure, then was still running when Stop was clicked.
+            self.app._encode_queue.put(("line", format_event(EV_ERROR) + "\n", out_mp4))
+            self.app._drain_encode_queue()
+            with mock.patch.object(gui, "terminate_process") as terminate:
+                self.app._stop()
+            terminate.assert_called_once_with(proc)
+            self.app._encode_queue.put(("done", 1, "", out_mp4, 1))
+            with mock.patch.object(gui.messagebox, "showerror") as err:
+                self.app._drain_encode_queue()
+            err.assert_called_once()
+            self.assertEqual(self.app._status_label.cget("text"), "Export failed")
+            self.assertEqual(self.app._preview_title.cget("text"), "Dream Result")
+
+    def test_encode_that_failed_before_stop_still_reports_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._ready_job(d)
+            self.app._preview_title.configure(text="Dream Result")
+            out_mp4 = os.path.join(d, "failed.mp4")
+            self._save_video_command(out_mp4)
+            proc = self.app._encode_proc
+            # The encoder already exited with an error before Stop was clicked.
+            proc.poll.return_value = 1
+            with mock.patch.object(gui, "terminate_process") as terminate:
+                self.app._stop()
+            terminate.assert_not_called()
+            self.assertFalse(self.app._video_export_cancelled)
+            self.app._encode_queue.put(("done", 1, "boom\n", out_mp4, 1))
+            with mock.patch.object(gui.messagebox, "showerror") as err:
+                self.app._drain_encode_queue()
+            err.assert_called_once()
+            self.assertEqual(self.app._status_label.cget("text"), "Export failed")
+            self.assertEqual(self.app._preview_title.cget("text"), "Dream Result")
+            self.assertIsNone(self.app._encode_proc)
+            self.assertFalse(self.app._video_save_in_progress)
+            self.assertTrue(self.app._has_ready_video_frames())
+
+    def _drain_until(self, done, timeout=120.0):
+        """Apply queued encode events on this thread until *done()* holds."""
+        deadline = time.monotonic() + timeout
+        while not done():
+            if time.monotonic() > deadline:
+                self.fail("timed out waiting for the encode subprocess")
+            self.app._drain_encode_queue()
+            time.sleep(0.02)
+
+    def test_stop_without_pid_event_sweeps_under_the_handle_pid(self):
+        # Until the encoder announces its own pid, the process handle's pid is the
+        # best guess for the name of its temp file.
+        with tempfile.TemporaryDirectory() as d:
+            self._ready_job(d)
+            out_mp4 = os.path.join(d, "handle.mp4")
+            self._save_video_command(out_mp4, pid=4242)
+            proc = self.app._encode_proc
+            proc.poll.return_value = None
+            partial = os.path.join(d, "handle.mp4.p4242.temp.mp4")
+            Path(partial).write_bytes(b"partial")
+            with mock.patch.object(gui, "terminate_process"):
+                self.app._stop()
+            self.app._encode_queue.put(("done", 1, "", out_mp4, 1))
+            with mock.patch.object(gui.messagebox, "showerror") as err:
+                self.app._drain_encode_queue()
+            err.assert_not_called()
+            self.assertFalse(os.path.exists(partial))
+            self.assertEqual(self.app._status_label.cget("text"), "Stopped")
+
+    @pytest.mark.integration
+    def test_real_encoder_stop_removes_its_partial_file_and_reports_stopped(self):
+        # A real encode subprocess, stopped through the GUI's own path. The encoder
+        # names its temp file with its own pid, and Stop must sweep that file.
+        self.addCleanup(_kill_leftover_children, self.app)
+        with tempfile.TemporaryDirectory() as d:
+            self._ready_job(d, frames_kw={"n": 400, "size": (640, 480)})
+            out_mp4 = os.path.join(d, "real_stop.mp4")
+            with (
+                mock.patch("tkinter.filedialog.asksaveasfilename", return_value=out_mp4),
+                mock.patch.object(gui.messagebox, "showerror") as err,
+            ):
+                self.app._on_save_video_click()
+                self._drain_until(lambda: self.app._progress.get() >= 0.05)
+                temp = os.path.join(d, f"real_stop.mp4.p{self.app._video_export_pid}.temp.mp4")
+                self.assertTrue(os.path.isfile(temp), "encoder did not create its temp file")
+                self.app._stop()
+                self._drain_until(lambda: self.app._encode_proc is None)
+            err.assert_not_called()
+            self.assertEqual(self.app._status_label.cget("text"), "Stopped")
+            self.assertFalse(os.path.exists(temp))
+            self.assertFalse(os.path.exists(out_mp4))
+
+    @pytest.mark.integration
+    def test_real_encoder_failure_is_reported_as_failure_and_leaves_no_temp(self):
+        self.addCleanup(_kill_leftover_children, self.app)
+        with tempfile.TemporaryDirectory() as d:
+            _job, fd = self._ready_job(d, frames_kw={"n": 10})
+            # The fourth frame cannot be decoded, so the real encoder fails mid-run.
+            Path(fd, "frame_000004.png").write_bytes(b"not a png")
+            out_mp4 = os.path.join(d, "real_fail.mp4")
+            with (
+                mock.patch("tkinter.filedialog.asksaveasfilename", return_value=out_mp4),
+                mock.patch.object(gui.messagebox, "showerror") as err,
+            ):
+                self.app._on_save_video_click()
+                self._drain_until(lambda: self.app._encode_proc is None)
+            err.assert_called_once()
+            self.assertEqual(self.app._status_label.cget("text"), "Export failed")
+            self.assertFalse(os.path.exists(out_mp4))
+            self.assertEqual([n for n in os.listdir(d) if n.startswith("real_fail.mp4.p")], [])
 
     def test_save_click_includes_audio_for_video_mode(self):
         with tempfile.TemporaryDirectory() as d:
@@ -2079,8 +2342,11 @@ class TestVideoExport(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self._ready_job(d)
             self.app._video_save_in_progress = True
-            with mock.patch.object(gui.messagebox, "showerror"):
+            with mock.patch.object(gui.messagebox, "showerror") as err:
                 self.app._finish_video_encode(1, "boom\n", os.path.join(d, "x.mp4"), 1)
+            # Without a user stop, a failed encode still reports the failure.
+            err.assert_called_once()
+            self.assertEqual(self.app._status_label.cget("text"), "Export failed")
             self.assertIsNone(self.app._output_path)
             self.assertTrue(self.app._has_ready_video_frames())
             self.assertEqual(self.app._save_video_btn.cget("state"), "normal")

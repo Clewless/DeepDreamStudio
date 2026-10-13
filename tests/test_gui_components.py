@@ -64,12 +64,33 @@ def test_generation_stream_reports_nonzero_completion_and_closes_pipe(tmp_path: 
     assert proc.stdout is not None and proc.stdout.closed
 
 
+def test_generation_stream_reports_lines_to_callback_before_completion(tmp_path: Path) -> None:
+    proc = start_cli_process(
+        [
+            sys.executable,
+            "-c",
+            'print(\'\\x00dd-event:{"event":"pid","pid":4242}\')',
+        ],
+        tmp_path,
+    )
+    messages: queue.Queue[str] = queue.Queue()
+    lines: list[str] = []
+
+    read_generation_output(proc, 42, messages, on_line=lines.append)
+
+    assert lines == ['\x00dd-event:{"event":"pid","pid":4242}\n']
+    assert messages.get_nowait() == lines[0]
+    assert messages.get_nowait() == f"{PROC_DONE_PREFIX}{id(proc)}:42"
+
+
 def test_export_stream_reports_failure_and_closes_pipe(tmp_path: Path) -> None:
     proc = start_cli_process(
         [sys.executable, "-c", "print('encoding'); raise SystemExit(3)"], tmp_path
     )
     messages: queue.Queue[tuple] = queue.Queue()
-    read_encode_output(proc, "output.mp4", 9, messages)
+    lines: list[str] = []
+    read_encode_output(proc, "output.mp4", 9, messages, on_line=lines.append)
+    assert lines == ["encoding\n"]
     assert messages.get_nowait() == ("line", "encoding\n", "output.mp4")
     assert messages.get_nowait() == ("done", 3, "", "output.mp4", 9)
     assert proc.stdout is not None and proc.stdout.closed
