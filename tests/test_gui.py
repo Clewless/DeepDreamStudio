@@ -2017,6 +2017,23 @@ class TestSavedVideoFramesHelpers(unittest.TestCase):
             Image.new("RGB", (8, 8)).save(os.path.join(d, "o1_i2.png"))
             self.assertEqual(count_saved_video_frames(d), 2)
 
+    def test_list_ignores_hidden_and_tmp_pngs(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as d:
+            Image.new("RGB", (8, 8)).save(os.path.join(d, ".frame_000001.tmp.png"))
+            Image.new("RGB", (8, 8)).save(os.path.join(d, "frame_000002.tmp.png"))
+            with open(os.path.join(d, "_gui_preview_p1_j1.png"), "wb") as fh:
+                fh.write(b"x")
+            self.assertEqual(list_saved_video_frames(d), [])
+            self.assertEqual(count_saved_video_frames(d), 0)
+
+            Image.new("RGB", (8, 8)).save(os.path.join(d, "still.png"))
+            self.assertEqual(
+                [os.path.basename(p) for p in list_saved_video_frames(d)],
+                ["still.png"],
+            )
+
     def test_list_and_meta_tolerate_missing_dir(self):
         missing = os.path.join("no", "such", "dir")
         self.assertEqual(list_saved_video_frames(missing), [])

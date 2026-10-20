@@ -1405,6 +1405,11 @@ class TestGuidedAndVideoFeatures(unittest.TestCase):
         self.assertEqual(res.returncode, 1)
         self.assertIn("--zoom-fps must be > 0", res.stderr)
 
+        for value in ("nan", "inf"):
+            res = run_cli([img_path, "--zoom", "--fps", value])
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("--zoom-fps must be finite", res.stderr)
+
         res = run_cli([img_path, "--video", "--video-blend", "2.5"])
         self.assertEqual(res.returncode, 1)
         self.assertIn("--video-blend must be between 0.0 and 1.0", res.stderr)
@@ -1670,6 +1675,22 @@ class TestGuidedAndVideoFeatures(unittest.TestCase):
             self.assertTrue(os.path.isfile(out))
             # float fps from meta is honored without an explicit --fps
             self.assertIn("@ 15", res.stdout)
+
+    def test_encode_frames_creates_missing_out_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            frames = os.path.join(td, "seq")
+            os.makedirs(frames)
+            for i in range(2):
+                Image.new("RGB", (64, 48)).save(os.path.join(frames, f"frame_{i + 1:06d}.png"))
+            out_dir = os.path.join(td, "new_out")
+            self.assertFalse(os.path.exists(out_dir))
+            res = run_cli(["--encode-frames", frames, "--out", out_dir])
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue(os.path.isdir(out_dir))
+            self.assertEqual(
+                [name for name in os.listdir(out_dir) if name.lower().endswith(".mp4")],
+                ["seq_zoom_crf17.mp4"],
+            )
 
     def test_encode_frames_explicit_fps_overrides_meta(self):
         with tempfile.TemporaryDirectory() as td:

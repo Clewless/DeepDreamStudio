@@ -401,9 +401,12 @@ class VideoPlaybackMixin:
         total = int(self._video_total or 0)
         if total <= 1:
             return
-        # Restart from the start when pressing play at the end.
+        # Restart from the start when pressing play at the end. Show frame 0
+        # immediately so the first scheduled tick advances to frame 1 instead
+        # of skipping it.
         if int(self._video_index) >= total - 1:
             self._video_index = 0
+            self._show_video_frame(0)
         self._video_playing = True
         if self._video_play_btn is not None:
             try:

@@ -1788,7 +1788,7 @@ def _run_encode_frames_mode(
     fps_explicit: bool = False,
     video_scale: int = 1,
 ) -> None:
-    """Encode-only mode: --encode-frames DIR --out OUT.mp4 (no dreaming).
+    """Encode-only mode: --encode-frames DIR --out OUT.mp4|DIR (no dreaming).
     Reads fps/audio defaults from the sequence meta.json unless overridden."""
     frames_dir = args.encode_frames
     if not os.path.isdir(frames_dir):
@@ -1798,7 +1798,8 @@ def _run_encode_frames_mode(
         raise SystemExit(f"Error: No PNG frames found in '{frames_dir}'.")
     meta = read_video_frames_meta(frames_dir)
     out = args.out
-    if os.path.isdir(out):
+    if os.path.isdir(out) or not out.lower().endswith(".mp4"):
+        ensure_output_dir(out)
         candidate = build_systematic_video_name(
             source=meta.get("source") or os.path.basename(os.path.normpath(frames_dir)),
             custom_name=meta.get("custom_name"),
@@ -1816,8 +1817,6 @@ def _run_encode_frames_mode(
         )
         resolved = resolve_name_conflict(out, candidate)
         out = os.path.join(out, resolved)
-    if not out.lower().endswith(".mp4"):
-        raise SystemExit(f"Error: --out must be an .mp4 path in encode mode, got '{args.out}'.")
     audio_from = args.encode_audio_from or meta.get("source")
     if not has_audio_stream(audio_from):
         audio_from = None
@@ -2197,6 +2196,8 @@ def _resolve_and_validate_args(
     fps_explicit = args.zoom_fps is not None
     if args.zoom_fps is None:
         args.zoom_fps = 30
+    if not math.isfinite(args.zoom_fps):
+        raise SystemExit(f"Error: --zoom-fps must be finite, got {args.zoom_fps}")
 
     if args.name is not None:
         validate_filename_stem(args.name)

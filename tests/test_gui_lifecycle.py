@@ -43,13 +43,14 @@ def test_playback_restarts_at_end_and_stop_prevents_late_tick(playback: VideoPla
         playback._start_video_playback()
         assert playback._video_index == 0
         assert playback._video_playing
+        show.assert_called_once_with(0)
         playback.after.assert_called_once_with(33, playback._video_tick)
         playback._stop_video_playback()
         playback.after_cancel.assert_called_once_with("next-tick")
         assert playback._video_after_id is None
         playback.after.reset_mock()
         playback._video_tick()  # A callback already delivered before cancellation.
-        show.assert_not_called()
+        show.assert_called_once_with(0)
         playback.after.assert_not_called()
 
 

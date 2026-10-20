@@ -27,7 +27,7 @@ Launch.bat     REM Windows launcher script
 - **Linux:** Run `./Launch.sh` from a terminal (see [Troubleshooting](#troubleshooting)).
 - **macOS:** Run `./Launch.sh` from a terminal (see [Troubleshooting](#troubleshooting)).
 
-The first launch sets everything up automatically (see [First launch](#first-launch)).
+The first launch sets everything up for you after a confirmation prompt (see [First launch](#first-launch)).
 
 Download and extract the **`.zip` asset** from the
 [latest release](https://github.com/Clewless/DeepDreamStudio/releases/latest),
@@ -116,7 +116,7 @@ sudo pacman -S tk
 brew install python-tk@3.13  # e.g. python-tk@3.11 for Python 3.11, python-tk@3.12 for 3.12
 ```
 
-The first time you run one, it creates `.venv`, installs the right requirements (CUDA or CPU), and verifies the install. See [First launch](#first-launch). The manual steps below are only for setting up an environment yourself to troubleshoot, or when working without the launcher scripts.
+The first time you run one, it creates `.venv`, asks before installing the right requirements (CUDA or CPU), and verifies the install. See [First launch](#first-launch). The manual steps below are only for setting up an environment yourself to troubleshoot, or when working without the launcher scripts.
 
 For NVIDIA GPUs use the CUDA requirements; otherwise use the standard requirements (CPU on Linux, CPU/MPS on macOS).
 
@@ -157,7 +157,9 @@ On first run, each launcher will:
 
 1. Find a supported Python interpreter (3.11–3.14 on Windows and Linux; 3.11–3.13 on macOS).
 2. Create `.venv` if it is missing, or repair it if the interpreter is broken or too old — the old folder is *renamed* to `.venv.bad-<timestamp>` after confirmation, never deleted.
-3. Install dependencies into `.venv` via `app/check_deps.py` (choosing `requirements-cuda.txt` on NVIDIA machines, otherwise `requirements.txt`), then confirm the stack imports before starting.
+3. Ask before downloading dependencies, then install them into `.venv` via `app/check_deps.py` (choosing `requirements-cuda.txt` on NVIDIA machines, otherwise `requirements.txt`) and confirm the stack imports before starting.
+
+The confirmation (`Install missing dependencies ...? [Y/n]`) is intentional because the CUDA wheels are large; the launchers keep this prompt. For unattended setup, invoke `app/check_deps.py` directly with `-y`/`--yes`.
 
 If the CUDA packages cannot be installed — a blocked or throttled connection to the PyTorch wheel index is the usual cause — the launcher retries with the standard CPU packages so you still get a working app, just without GPU acceleration.
 

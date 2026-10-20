@@ -454,8 +454,8 @@ def list_saved_video_frames(frames_dir: str | Path | None) -> list[str]:
         n
         for n in names
         if n.lower().endswith(".png")
-        and not n.lower().startswith("_gui_preview")
-        and not n.lower().endswith(".tmp")
+        and not n.lower().startswith(("_gui_preview", "."))
+        and not n.lower().endswith((".tmp", ".tmp.png"))
     ]
     generic.sort(
         key=lambda text: [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", text)]
