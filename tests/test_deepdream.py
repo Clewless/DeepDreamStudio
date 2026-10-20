@@ -61,6 +61,25 @@ def run_cli(args: list[str]) -> CliResult:
     return CliResult(code, buf_out.getvalue(), buf_err.getvalue())
 
 
+class _TtyStringIO(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+class TestInteractiveEventSuppression(unittest.TestCase):
+    def test_events_are_suppressed_on_a_terminal(self):
+        out = _TtyStringIO()
+        with contextlib.redirect_stdout(out):
+            deepdream.emit_event("done", path="out.png")
+        self.assertEqual(out.getvalue(), "")
+
+    def test_events_remain_available_through_a_pipe(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            deepdream.emit_event("done", path="out.png")
+        self.assertIn(format_event("done", path="out.png"), out.getvalue())
+
+
 class TestEncodeFailureAnnouncement(unittest.TestCase):
     def test_failure_is_announced_before_the_writer_is_closed(self):
         with tempfile.TemporaryDirectory() as d:

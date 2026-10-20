@@ -274,3 +274,100 @@ def test_video_encode_uses_yuv420_and_applies_scale(
         decoded_pil = Image.fromarray(decoded).resize((32, 32), Image.Resampling.LANCZOS)
         decoded = np.asarray(decoded_pil)
     assert np.abs(rgb.astype(int) - decoded.astype(int)).mean() <= 6
+
+
+@pytest.mark.parametrize(
+    ("compiler", "frame_name"),
+    [
+        (deepdream.compile_video_frames, "frame_000001.png"),
+        (deepdream.compile_timelapse, "o1_i1.png"),
+    ],
+)
+def test_video_export_warns_before_overwriting(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], compiler: Any, frame_name: str
+) -> None:
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8)).save(frames / frame_name)
+    output = tmp_path / "video.mp4"
+    output.write_bytes(b"previous output")
+
+    compiler(str(frames), str(output), fps=1)
+
+    assert "already exists" in capsys.readouterr().err
+
+
+def _video_resume_kwargs(source: Path, frames: Path, output: Path | None) -> dict[str, Any]:
+    return {
+        "model": None,
+        "model_key": "googlenet",
+        "video_in_path": str(source),
+        "video_out_path": str(output) if output is not None else None,
+        "targets": ["inception4c"],
+        "iterations_per_frame": 0,
+        "lr": 0.03,
+        "jitter": 0,
+        "blend_alpha": 0.5,
+        "device": "cpu",
+        "max_size": 64,
+        "frames_dir": str(frames),
+        "resume": True,
+    }
+
+
+def _write_frames(frames: Path, count: int) -> None:
+    frames.mkdir()
+    for index in range(1, count + 1):
+        Image.fromarray(np.full((32, 32, 3), index * 40, dtype=np.uint8)).save(
+            frames / f"frame_{index:06d}.png"
+        )
+
+
+def test_video_resume_refuses_saved_sequence_longer_than_source(tmp_path: Path) -> None:
+    frames = tmp_path / "frames"
+    _write_frames(frames, 4)
+    source = tmp_path / "source.mp4"
+    source.touch()
+    output = tmp_path / "out.mp4"
+    original_frames = {path.name: path.read_bytes() for path in frames.glob("frame_*.png")}
+
+    with (
+        mock.patch.object(deepdream.iio, "immeta", return_value={"fps": 30, "duration": 2 / 30}),
+        mock.patch.object(
+            deepdream.iio,
+            "imiter",
+            side_effect=lambda *a, **k: iter([np.zeros((32, 32, 3), dtype=np.uint8)] * 2),
+        ),
+        pytest.raises(SystemExit, match="saved sequence has 4 frames"),
+    ):
+        deepdream.dream_video_file(**_video_resume_kwargs(source, frames, output))
+
+    assert not output.exists()
+    assert not (frames / "meta.json").exists()
+    assert {path.name: path.read_bytes() for path in frames.glob("frame_*.png")} == original_frames
+
+
+def test_video_resume_of_complete_sequence_encodes_all_saved_frames(tmp_path: Path) -> None:
+    frames = tmp_path / "frames"
+    _write_frames(frames, 2)
+    source = tmp_path / "source.mp4"
+    source.touch()
+    output = tmp_path / "out.mp4"
+
+    def publish_silent(temp_out: str, _source: str, final_out: str) -> str:
+        deepdream._publish_media(temp_out, final_out)
+        return final_out
+
+    with (
+        mock.patch.object(deepdream.iio, "immeta", return_value={"fps": 30, "duration": 2 / 30}),
+        mock.patch.object(
+            deepdream.iio,
+            "imiter",
+            side_effect=lambda *a, **k: iter([np.zeros((32, 32, 3), dtype=np.uint8)] * 2),
+        ),
+        mock.patch.object(deepdream, "_remux_audio", side_effect=publish_silent),
+    ):
+        deepdream.dream_video_file(**_video_resume_kwargs(source, frames, output))
+
+    assert output.is_file()
+    assert len(list(deepdream.iio.imiter(str(output)))) == 2

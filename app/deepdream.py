@@ -96,11 +96,33 @@ from .protocol import (
 )
 
 
+def _emit_structured_events() -> bool:
+    """Keep event lines out of an interactive terminal, but in piped output.
+
+    The GUI and integration tests read events from a pipe, while a human running
+    the CLI directly would otherwise see the NUL-prefixed JSON on every step.
+    """
+    stream = sys.stdout
+    if stream is None:
+        return False
+    isatty = getattr(stream, "isatty", None)
+    if isatty is None:
+        return True
+    try:
+        return not bool(isatty())
+    except (OSError, ValueError):
+        return True
+
+
 def emit_event(event: str, **fields: Any) -> None:
     """Emit a structured progress event for the GUI, alongside normal output.
 
-    Also printed as text so a human reading the console loses nothing.
+    Events are printed as text so the GUI can parse progress, but they are
+    suppressed when stdout is an interactive terminal. A human still sees the
+    ordinary progress lines; scripts can pipe the command to keep the events.
     """
+    if not _emit_structured_events():
+        return
     print(format_event(event, **fields), flush=True)
 
 
@@ -183,7 +205,7 @@ FFMPEG_PRESETS = frozenset(
     }
 )
 
-# Audio-remux ffmpeg only stream-copies; 600s is a stuck-process ceiling.
+# Audio-remux ffmpeg re-encodes the audio track to AAC; 600s is a stuck-process ceiling.
 FFMPEG_REMUX_TIMEOUT = 600.0
 
 
@@ -228,6 +250,17 @@ def ensure_output_dir(path):
         os.makedirs(path, exist_ok=True)
     except OSError as exc:
         raise SystemExit(f"Error: could not create output directory '{path}': {exc}") from exc
+
+
+def _warn_on_overwrite(path: str) -> None:
+    """Warn before replacing an existing video/timelapse output."""
+    if path and os.path.exists(path):
+        print(
+            f"Warning: output file '{path}' already exists and will be "
+            "overwritten. Use --name or --out to keep the previous result.",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def apply_zoom_and_rotate(t, zoom_scale=1.03, zoom_rot=0.0, zoom_cx=0.5, zoom_cy=0.5):
@@ -957,6 +990,7 @@ def dream_zoom_animation(
         raise ValueError("dream_zoom_animation needs out_path and/or frames_dir")
     if encode:
         ensure_output_dir(os.path.dirname(out_path) or ".")
+        _warn_on_overwrite(out_path)
     img = img.to(device)
     # Ensure dimensions are even for H.264 encoder compatibility
     ih, iw = img.shape[2], img.shape[3]
@@ -1198,6 +1232,7 @@ def dream_video_file(
 
     if encode:
         ensure_output_dir(os.path.dirname(video_out_path) or ".")
+        _warn_on_overwrite(video_out_path)
     # Decode and validate the first frame before any destructive frame-folder
     # preparation. A missing/corrupt/too-small video fails before --clear-frames
     # removes a sequence, but only the first frame is checked: a video that
@@ -1311,14 +1346,13 @@ def dream_video_file(
     frame_idx = 0
     keep_temp = False
     writer = None
+    writer_seeded = start_frame <= 0
     try:
         # Created inside the outer try (like dream_zoom_animation) so a
         # get_writer() failure still runs the temp-file cleanup below
         # instead of leaking a partial *.temp.mp4.
         if encode and temp_out:
             writer = _open_video_writer(temp_out, fps, output_params)
-            if start_frame > 0 and frames_dir:
-                _append_saved_video_frames(writer, frames_dir, start_frame, scale)
         try:
             loss = 0.0
             target_canvas_size = None
@@ -1337,7 +1371,11 @@ def dream_video_file(
                         model_key,
                         what="Video frame",
                     )
-                    if frames_dir:
+                    if frames_dir and start_frame == 0:
+                        # A fresh sequence records its geometry before the first
+                        # frame. A resumed one keeps its existing metadata until
+                        # the run completes, so a rejected/short source cannot
+                        # overwrite the saved total.
                         write_video_frames_meta(
                             frames_dir,
                             width=target_canvas_size[0],
@@ -1352,6 +1390,13 @@ def dream_video_file(
 
                 if frame_idx <= start_frame:
                     continue
+
+                # Seed the encoder only after the source has proven long enough
+                # to contain the saved frames. Otherwise a shortened source
+                # would produce a video longer than its input.
+                if writer is not None and not writer_seeded and frames_dir:
+                    _append_saved_video_frames(writer, frames_dir, start_frame, scale)
+                    writer_seeded = True
 
                 frame_t = pil_to_tensor(pil_frame).to(device)
 
@@ -1404,6 +1449,18 @@ def dream_video_file(
             ):
                 print(f"[PREVIEW] {preview_file}", flush=True)
                 emit_event(EV_PREVIEW, path=preview_file)
+            if start_frame > frame_idx:
+                raise SystemExit(
+                    f"Error: cannot resume in '{frames_dir}': the saved sequence has "
+                    f"{start_frame} frames, but the source video has only {frame_idx}. "
+                    "Start a new sequence with --clear-frames (without --resume) or "
+                    "use a different --frames-dir."
+                )
+            if writer is not None and not writer_seeded and frames_dir:
+                # The source ended exactly at the saved frame count; encode the
+                # complete saved sequence without adding new frames.
+                _append_saved_video_frames(writer, frames_dir, start_frame, scale)
+                writer_seeded = True
         finally:
             if writer is not None:
                 writer.close()
@@ -1572,14 +1629,15 @@ def _warn_remux_failure(res=None):
 
 
 def _remux_audio(silent_mp4, audio_source, final_out):
-    """Remux *audio_source*'s audio onto *silent_mp4* to *final_out*, atomically.
-    Stream-copies through a temp file and returns the final path; a failed remux
-    warns and falls back to the silent video."""
+    """Mux *audio_source*'s audio onto *silent_mp4* to *final_out*, atomically.
+
+    The audio is re-encoded to AAC through a temp file and the final path is
+    returned; a failed remux warns and falls back to the silent video."""
     remux_out = _atomic_tmp_path(final_out, ".remux.temp.mp4")
     _remove_stale_temps(remux_out, final_out + ".remux.temp.mp4")
     target = silent_mp4
     try:
-        print("Remuxing audio track...", flush=True)
+        print("Remuxing audio track (AAC)...", flush=True)
         emit_event(EV_STATUS, text="Remuxing audio...")
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         res = subprocess.run(
@@ -1642,7 +1700,8 @@ def compile_video_frames(
 ):
     """Encode a saved frame sequence (frame_*.png) to .mp4.
     The save half of the generate/save split, so frames export at any quality
-    without re-running the dream; audio from *audio_from* or the meta is remuxed."""
+    without re-running the dream; audio from *audio_from* or the meta is carried
+    over as AAC."""
     if not _VIDEO_AVAILABLE:
         raise SystemExit(
             "Error: 'imageio' and 'imageio-ffmpeg' are required for video export.\n"
@@ -1659,6 +1718,7 @@ def compile_video_frames(
         # A zoom animation's source is a still image, so there is nothing to
         # remux; skip ffmpeg entirely rather than run it for no reason.
         audio_from = None
+    _warn_on_overwrite(out_path)
     temp_out = _encode_png_sequence(files, out_path, fps=fps, crf=crf, preset=preset, scale=scale)
     keep_temp = False
     try:
@@ -1702,6 +1762,7 @@ def compile_timelapse(frames_dir, out_path, fps=30, crf=17, preset="medium", sca
     if not files:
         raise SystemExit(f"Error: No PNG frames found in '{frames_dir}'.")
 
+    _warn_on_overwrite(out_path)
     temp_out = _encode_png_sequence(
         files, out_path, fps=fps, crf=crf, preset=preset, scale=scale, what="timelapse"
     )
@@ -1949,8 +2010,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
         "--encode-audio-from",
         default=None,
         metavar="SOURCE_VIDEO",
-        help="with --encode-frames: remux the audio track from SOURCE_VIDEO "
-        "onto the export (defaults to the sequence meta.json source, if any)",
+        help="with --encode-frames: encode the audio track from SOURCE_VIDEO "
+        "as AAC onto the export (defaults to the sequence meta.json source, if any)",
     )
     ap.add_argument(
         "--zoom-x",
