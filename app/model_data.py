@@ -204,16 +204,23 @@ def layer_value_map(model_key):
     return {label: key for key, label in MODEL_META[model_key]["layers"]}
 
 
-# H.264 CRF and encoder speed preset per quality name.
+# H.264 CRF, encoder speed preset, and encode-geometry scale per quality name.
+# scale multiplies encode width/height (2x = 4x pixels); saved frames stay native.
 class VideoQualityPreset(TypedDict):
     crf: int
     preset: str
+    scale: int
 
 
+# "lossless" means visually lossless, not bit-exact: CRF 12 at 2x resolution
+# (4x pixels) in YUV 4:2:0, so chroma density after subsampling matches
+# native-resolution 4:4:4. All presets use yuv420p, so even CRF 0 (--crf 0) is
+# not bit-exact. The 2x frame can exceed the H.264 Level 5.1 frame-size limit;
+# see "Frame-size limit" in CLI/README.md.
 VIDEO_QUALITY_PRESETS: dict[str, VideoQualityPreset] = {
-    "small": {"crf": 28, "preset": "fast"},
-    "balanced": {"crf": 17, "preset": "medium"},
-    "lossless": {"crf": 0, "preset": "medium"},
+    "small": {"crf": 28, "preset": "fast", "scale": 1},
+    "balanced": {"crf": 17, "preset": "medium", "scale": 1},
+    "lossless": {"crf": 12, "preset": "medium", "scale": 2},
 }
 
 VIDEO_FRAMES_META = "meta.json"

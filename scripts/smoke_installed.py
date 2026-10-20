@@ -39,7 +39,12 @@ def main() -> None:
                 "-I",
                 "-c",
                 "from app.gui import DeepDreamGUI; "
-                "window = DeepDreamGUI(); window.update(); window._on_close()",
+                "from app.gui_helpers import resolve_out_dir; "
+                "from pathlib import Path; "
+                "assert Path(resolve_out_dir('')) == Path.home() / 'DeepDream Studio' / 'out'; "
+                "window = DeepDreamGUI(); "
+                "assert window._out_dir.get() == resolve_out_dir(''); "
+                "window.update(); window._on_close()",
             ],
         ]
         for command in commands:

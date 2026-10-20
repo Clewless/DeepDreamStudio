@@ -18,6 +18,8 @@ out/
 # anywhere, so ignore by pattern too.
 *.tmp
 *.temp.mp4
+*.tmp.complete
+*.temp.mp4.complete
 _gui_preview*.png
 
 # Secrets

@@ -10,7 +10,7 @@ Usage (from the repository root):
 
 import os
 import queue
-import shutil
+import re
 import subprocess
 import sys
 import threading
@@ -119,6 +119,41 @@ __all__ = ["DeepDreamGUI", "main"]
 
 # Ordered model display labels for the model dropdown.
 MODEL_LABELS = [MODEL_META[k]["label"] for k in MODEL_KEYS]
+
+# Temp names written by media_io.atomic_tmp_path and the video writers. Used to
+# recognize recovery sidecars left behind by any process, not just this pid.
+_TEMP_NAME_RE = re.compile(r"\.p\d+\.tmp$|\.p\d+\.(?:remux\.)?temp\.mp4$", re.IGNORECASE)
+_COMPLETE_MARKER = ".complete"
+
+
+def _remove_unprotected_files(root: str) -> bool:
+    """Delete files under root, keeping completed outputs and their sidecars.
+
+    A file with a ``.complete`` sidecar is a finished output; the file and its
+    sidecar are both kept. Directories are removed only when emptied. Returns
+    True if anything was kept.
+    """
+    kept = False
+    for dirpath, _dirnames, filenames in os.walk(root, topdown=False):
+        names = set(filenames)
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if name.lower().endswith(_COMPLETE_MARKER):
+                if name[: -len(_COMPLETE_MARKER)] in names:
+                    kept = True
+                    continue
+            elif name + _COMPLETE_MARKER in names:
+                kept = True
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                kept = True
+        try:
+            os.rmdir(dirpath)
+        except OSError:
+            kept = True
+    return kept
 
 
 PRESETS: dict[str, dict[str, Any] | None] = {
@@ -308,7 +343,7 @@ class DeepDreamGUI(
         self.configure(bg=BG_DEEP)
 
         self._image_path = tk.StringVar()
-        self._out_dir = tk.StringVar(value=str(ROOT / "out"))
+        self._out_dir = tk.StringVar(value=resolve_out_dir(""))
         self._model_var = tk.StringVar(value=DEFAULT_MODEL_LABEL)
         self._layer_var = tk.StringVar(value=MODEL_META[DEFAULT_MODEL_KEY]["recommended"])
         _defs = MODEL_META[DEFAULT_MODEL_KEY]["defaults"]
@@ -351,6 +386,10 @@ class DeepDreamGUI(
         self._input_pil = None
         self._input_pil_path = None
         self._input_pil_mtime = None
+        # Previously loaded input paths (None = empty state), for the drop-zone
+        # context menu's Undo action.
+        self._input_history: list[str | None] = []
+        self._drop_zone_menu = None
         self._dream_pil = None
         self._aligned_input_pil = None
         self._compare_mode = "Dream"  # "Dream", "Slide Reveal", or "Original"
@@ -649,12 +688,16 @@ class DeepDreamGUI(
             text="Click to browse\nor drop an image here",
             font=ModernFont(family="Segoe UI", size=12),
             text_color=TEXT_DIM,
-            height=110,
+            height=140,
             fg_color=BG_PANEL,
             cursor="hand2",
         )
         self._drop_zone.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
         self._drop_zone.bind("<Button-1>", lambda e: self._browse_image())
+        # Right-click is Button-3 on Windows/Linux but Button-2 on macOS/Aqua.
+        self._drop_zone.bind("<Button-3>", self._show_drop_zone_menu)
+        if sys.platform == "darwin":
+            self._drop_zone.bind("<Button-2>", self._show_drop_zone_menu)
         self._drop_zone.bind("<Enter>", lambda e: self._drop_zone.configure(fg_color=BORDER))
         self._drop_zone.bind("<Leave>", lambda e: self._drop_zone.configure(fg_color=BG_PANEL))
         if _DND_AVAILABLE:
@@ -674,7 +717,8 @@ class DeepDreamGUI(
         Tooltip(
             self._drop_zone,
             "Click to browse or drop an image/video file. "
-            "Multiple dropped images are queued as separate jobs.",
+            "Multiple dropped images are queued as separate jobs. "
+            "Right-click for Open Directory, Clear and Undo.",
         )
 
         self._img_path_label = ModernLabel(
@@ -1667,7 +1711,7 @@ class DeepDreamGUI(
             self._timelapse.set(False)
             self._save_frames.set(False)
             if not self._image_path.get():
-                self._drop_zone.configure(text="Click to browse\nor drop initial image here")
+                self._drop_zone.configure(text=self._drop_zone_placeholder())
         elif mode == "Dream Video":
             self._video_frame.grid(row=16, column=0, sticky="ew", padx=16, pady=(0, 8))
             self._timelapse_cb.grid_remove()
@@ -1675,12 +1719,12 @@ class DeepDreamGUI(
             self._timelapse.set(False)
             self._save_frames.set(False)
             if not self._image_path.get():
-                self._drop_zone.configure(text="Click to browse\nor drop a video file here")
+                self._drop_zone.configure(text=self._drop_zone_placeholder())
         else:
             self._timelapse_cb.grid()
             self._save_frames_cb.grid()
             if not self._image_path.get():
-                self._drop_zone.configure(text="Click to browse\nor drop an image here")
+                self._drop_zone.configure(text=self._drop_zone_placeholder())
         self._update_video_quality_visibility(mode)
         # Entering Zoom mode with an input but no output yet: show the
         # input with the focus reticle so the user can click to aim right
@@ -1923,7 +1967,7 @@ class DeepDreamGUI(
         if path:
             self._load_image_preview(path)
 
-    def _load_image_preview(self, path):
+    def _load_image_preview(self, path, record_history=True):
         self._reset_run_button_if_resuming()
         path = str(path).strip().strip("\"'")
         ext = Path(path).suffix.lower()
@@ -1955,6 +1999,11 @@ class DeepDreamGUI(
                 messagebox.showerror("Cannot open image", str(exc))
                 return
 
+        previous = self._image_path.get().strip()
+        if record_history and previous != path:
+            # Remember what is being replaced so the drop-zone context menu's
+            # Undo action can restore it (None = the empty state).
+            self._push_input_history(previous or None)
         self._image_path.set(path)
         self._input_pil = pil.copy()
         self._input_pil_path = os.path.normcase(os.path.abspath(path))
@@ -1977,7 +2026,7 @@ class DeepDreamGUI(
         self._compare_frame.grid_remove()
 
         thumb = pil.copy()
-        thumb.thumbnail((280, 110))
+        thumb.thumbnail((300, 140))
         preview_thumb = ModernImage(thumb, size=(thumb.width, thumb.height))
         # width=0/height=0 auto-sizes to the thumbnail: a fixed text-unit height
         # is read as *pixels* once an image is present, crushing the preview to a
@@ -2001,6 +2050,131 @@ class DeepDreamGUI(
             self._preview_label.configure(image="", text="Input loaded \u2014 press \u25b6 Dream")
             self._preview_title.configure(text="Output Preview")
         self._log_msg(f"Loaded: {path}\n")
+
+    def _drop_zone_placeholder(self):
+        mode = self._mode_var.get()
+        if mode == "Dream Zoom":
+            return "Click to browse\nor drop initial image here"
+        if mode == "Dream Video":
+            return "Click to browse\nor drop a video file here"
+        return "Click to browse\nor drop an image here"
+
+    def _push_input_history(self, path):
+        history = self._input_history
+        if history and history[-1] == path:
+            return
+        history.append(path)
+        del history[:-20]  # cap undo depth
+
+    def _show_drop_zone_menu(self, event):
+        """Right-click menu on the input drop zone: Open Directory / Clear / Undo."""
+        menu = tk.Menu(
+            self,
+            tearoff=0,
+            bg=BG_PANEL,
+            fg=TEXT_MAIN,
+            activebackground=BORDER,
+            activeforeground=ACCENT_HOVER,
+            font=ModernFont(family="Segoe UI", size=10),
+        )
+        has_input = bool(self._image_path.get().strip())
+        menu.add_command(
+            label="Open Directory",
+            command=self._open_input_directory,
+            state="normal" if has_input else "disabled",
+        )
+        menu.add_command(
+            label="Clear",
+            command=self._clear_input_image,
+            state="normal" if has_input else "disabled",
+        )
+        menu.add_command(
+            label="Undo",
+            command=self._undo_input_image,
+            state="normal" if self._input_history else "disabled",
+        )
+        # Keep a reference: a local-only Menu can be garbage-collected while
+        # still posted on some Tk builds.
+        self._drop_zone_menu = menu
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _open_input_directory(self):
+        """Open the folder containing the loaded input, file highlighted when possible."""
+        path = self._image_path.get().strip().strip("\"'")
+        if not path:
+            return
+        target = os.path.abspath(path)
+        try:
+            if os.path.isfile(target):
+                cmd = build_reveal_command(target)
+                if cmd is not None:
+                    subprocess.Popen(cmd)
+                    return
+                self._open_file_cross_platform(os.path.dirname(target) or target)
+                return
+            parent = os.path.dirname(target)
+            if parent and os.path.isdir(parent):
+                self._open_file_cross_platform(parent)
+        except (OSError, ValueError):
+            pass
+
+    def _clear_input_image(self):
+        """Remove the loaded input media and restore the empty drop-zone placeholder."""
+        current = self._image_path.get().strip()
+        if not current and self._input_pil is None:
+            return
+        self._push_input_history(current or None)
+        self._apply_empty_input()
+        self._log_msg("Cleared input media.\n")
+
+    def _apply_empty_input(self):
+        self._image_path.set("")
+        self._input_pil = None
+        self._input_pil_path = None
+        self._input_pil_mtime = None
+        self._dream_pil = None
+        self._aligned_input_pil = None
+        self._preview_pil = None
+        self._output_path = None
+        self._timelapse_mp4 = None
+        self._viewer_mode = "image"
+        self._compare_mode = "Dream"
+        self._showing_zoom_focus = False
+        self._teardown_video()
+        self._reset_viewer()
+        self._hide_zoom_bar()
+        self._open_dir_btn.grid_remove()
+        try:
+            self._view_image_btn.grid_remove()
+            self._view_timelapse_btn.grid_remove()
+        except tk.TclError:
+            pass
+        self._compare_frame.grid_remove()
+        # height=140 (pixels -> text units) restores the empty-zone size; once
+        # an image has been shown, a leftover 0 here is read as *pixels*.
+        self._drop_zone.configure(image="", text=self._drop_zone_placeholder(), width=0, height=140)
+        self._drop_zone.image = None
+        try:
+            self._preview_label.configure(image="", text="Run a dream to see the output here")
+        except tk.TclError:
+            pass
+
+    def _undo_input_image(self):
+        """Restore the previously loaded input (or the empty state)."""
+        if not self._input_history:
+            return
+        previous = self._input_history.pop()
+        if not previous:
+            self._apply_empty_input()
+            self._log_msg("Undo: cleared input media.\n")
+            return
+        if not os.path.isfile(previous):
+            messagebox.showwarning("Undo", f"The previous input no longer exists:\n{previous}")
+            return
+        self._load_image_preview(previous, record_history=False)
 
     def _browse_guide_image(self):
         path = filedialog.askopenfilename(
@@ -2839,6 +3013,9 @@ class DeepDreamGUI(
                 "Literal['Small', 'Balanced', 'Lossless', 'Custom']", self._video_quality_var.get()
             ),
             video_crf=self._video_crf.get(),
+            video_preset=cast(
+                "Literal['Small', 'Balanced', 'Lossless']", self._video_quality_preset
+            ),
             guidance_mode=cast("Literal['Unguided', 'Guide Image', 'Target Class']", guidance_mode),
             guide_path=guide_path,
             target_class=target_class,
@@ -3511,8 +3688,13 @@ class DeepDreamGUI(
         ):
             return
         if os.path.isdir(self._frames_dir):
-            shutil.rmtree(self._frames_dir, ignore_errors=True)
-            self._log_msg("Removed partial frames.\n", color=WARNING)
+            kept = _remove_unprotected_files(self._frames_dir)
+            if kept:
+                self._log_msg(
+                    "Kept completed outputs; removed other partial frames.\n", color=WARNING
+                )
+            else:
+                self._log_msg("Removed partial frames.\n", color=WARNING)
 
     def _cleanup_preview_temps(self):
         if not self._preview_tmp_path:
@@ -3527,7 +3709,8 @@ class DeepDreamGUI(
     def _cleanup_job_temps(self, out_dir, pid):
         """Remove pid-qualified temp files an interrupted child may have left.
         deepdream.py cleans these on normal failures, but a force-killed child
-        (Stop / window close) runs no cleanup: ``*.p<pid>.tmp`` and temp mp4s."""
+        (Stop / window close) runs no cleanup. Completed outputs with a
+        ``.complete`` sidecar are recoverable and must survive this sweep."""
         if not out_dir or not pid:
             return
         suffixes = (f".p{pid}.tmp", f".p{pid}.temp.mp4", f".p{pid}.remux.temp.mp4")
@@ -3535,8 +3718,24 @@ class DeepDreamGUI(
             entries = os.listdir(out_dir)
         except OSError:
             return
+        marker_suffix = ".complete"
         for name in entries:
-            if name.lower().endswith(suffixes):
+            lower = name.lower()
+            if lower.endswith(marker_suffix):
+                # A marker whose temp file is already gone (the force-kill landed
+                # after replacement) is stale. Markers for a live temp are kept.
+                # Any pid's temp is eligible: a killed earlier process never
+                # gets its own sweep.
+                base = name[: -len(marker_suffix)]
+                if _TEMP_NAME_RE.search(base) and not os.path.exists(os.path.join(out_dir, base)):
+                    try:
+                        os.remove(os.path.join(out_dir, name))
+                    except OSError:
+                        pass
+                continue
+            if lower.endswith(suffixes):
+                if os.path.isfile(os.path.join(out_dir, name + marker_suffix)):
+                    continue
                 try:
                     os.remove(os.path.join(out_dir, name))
                 except OSError:

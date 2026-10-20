@@ -24,6 +24,8 @@ class VideoExportRequest:
     quality: str
     crf: int
     audio_from: str | None = None
+    # Named preset whose geometry (1x/2x) applies even when the CRF was edited.
+    preset: str | None = None
 
     def build_cmd(self) -> list[str]:
         cmd = [
@@ -37,7 +39,7 @@ class VideoExportRequest:
             "--fps",
             f"{self.fps:.2f}",
         ]
-        quality = self.quality.lower()
+        quality = (self.preset or self.quality).lower()
         if quality in ("small", "balanced", "lossless"):
             cmd += ["--video-quality", quality]
         cmd += ["--crf", str(self.crf)]

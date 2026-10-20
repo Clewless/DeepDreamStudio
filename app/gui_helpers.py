@@ -289,15 +289,23 @@ def _fmt_slider_value(v: float, is_int: bool) -> str:
     return str(int(round(v))) if is_int else f"{v:.3f}"
 
 
+def output_base_dir() -> Path:
+    """Keep launcher outputs local; installed wheels store artwork in the user's home."""
+    has_launcher = (ROOT / "Launch.sh").is_file() or (ROOT / "Launch.bat").is_file()
+    if (ROOT / "pyproject.toml").is_file() and has_launcher:
+        return ROOT
+    return Path.home() / "DeepDream Studio"
+
+
 def resolve_out_dir(value: str, base: str | Path | None = None) -> str:
-    """Resolve the output directory path, anchoring relative values to the script root."""
+    """Resolve outputs against the source root or an installed app's user-owned base."""
     val = value.strip().strip("\"'")
     if not val:
-        anchor = base if base is not None else ROOT
+        anchor = base if base is not None else output_base_dir()
         return str(Path(anchor) / "out")
     if os.path.isabs(val):
         return val
-    anchor = ROOT if base is None else Path(base)
+    anchor = output_base_dir() if base is None else Path(base)
     _drive, tail = os.path.splitdrive(val)
     if _drive:
         if not tail or tail.strip(" \\/") == "":

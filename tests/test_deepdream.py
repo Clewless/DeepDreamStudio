@@ -93,6 +93,34 @@ class TestEncodeFailureAnnouncement(unittest.TestCase):
             self.assertEqual(announced_at_close, [True])
 
 
+class TestCompileVideoFramesCompatibility(unittest.TestCase):
+    def test_audio_from_remains_the_sixth_positional_argument(self):
+        with tempfile.TemporaryDirectory() as td:
+            frames_dir = os.path.join(td, "frames")
+            os.makedirs(frames_dir)
+            frame = os.path.join(frames_dir, "frame_000001.png")
+            Image.new("RGB", (16, 16)).save(frame)
+            audio = os.path.join(td, "audio.mp4")
+            Path(audio).touch()
+            out_path = os.path.join(td, "out.mp4")
+            temp_out = os.path.join(td, "temp.mp4")
+
+            with (
+                mock.patch.object(deepdream, "_VIDEO_AVAILABLE", True),
+                mock.patch.object(deepdream, "has_audio_stream", return_value=True),
+                mock.patch.object(
+                    deepdream, "_encode_png_sequence", return_value=temp_out
+                ) as encode,
+                mock.patch.object(deepdream, "_remux_audio", return_value=out_path) as remux,
+            ):
+                deepdream.compile_video_frames(frames_dir, out_path, 30, 17, "medium", audio)
+
+            encode.assert_called_once_with(
+                [frame], out_path, fps=30, crf=17, preset="medium", scale=1
+            )
+            remux.assert_called_once_with(temp_out, audio, out_path)
+
+
 class TestDeepDream(unittest.TestCase):
     device: str
     model: Any
@@ -1595,7 +1623,7 @@ class TestGuidedAndVideoFeatures(unittest.TestCase):
             small = os.path.join(td, "small.mp4")
             lossless = os.path.join(td, "lossless.mp4")
             deepdream.compile_video_frames(frames, small, fps=10, crf=28, preset="fast")
-            deepdream.compile_video_frames(frames, lossless, fps=10, crf=0)
+            deepdream.compile_video_frames(frames, lossless, fps=10, crf=12)
             for p in (small, lossless):
                 self.assertTrue(os.path.isfile(p), p)
                 self.assertGreater(os.path.getsize(p), 0, p)
@@ -1698,10 +1726,25 @@ class TestGuidedAndVideoFeatures(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("--frames-only requires --zoom or --video", res.stderr)
 
-    def test_clear_frames_cli_requires_iteration_frame_mode(self):
+    def test_clear_frames_cli_requires_a_frame_saving_mode(self):
         res = run_cli([self.sample_img_path, "--clear-frames"])
         self.assertNotEqual(res.returncode, 0)
-        self.assertIn("--clear-frames requires --frames or --timelapse", res.stderr)
+        self.assertIn(
+            "--clear-frames requires --frames, --timelapse, --zoom, or --video", res.stderr
+        )
+
+    def test_clear_frames_cli_rejects_resume(self):
+        res = run_cli(
+            [self.sample_img_path, "--zoom", "--frames-dir", "seq", "--clear-frames", "--resume"]
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("--clear-frames cannot be combined with --resume", res.stderr)
+
+    def test_clear_frames_cli_needs_a_frame_folder_for_zoom(self):
+        res = run_cli([self.sample_img_path, "--zoom", "--clear-frames"])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("--clear-frames with --zoom or --video needs a frame folder", res.stderr)
+        self.assertIn("add --frames-dir or --frames-only.", res.stderr)
 
     @pytest.mark.integration
     def test_cli_multi_image_queue(self):
@@ -1818,21 +1861,28 @@ class TestGuidedAndVideoFeatures(unittest.TestCase):
 
     def test_resolve_video_quality(self):
         # Presets
-        crf_s, pr_s = deepdream.resolve_video_quality("small")
+        crf_s, pr_s, sc_s = deepdream.resolve_video_quality("small")
         self.assertEqual(crf_s, 28)
         self.assertEqual(pr_s, "fast")
+        self.assertEqual(sc_s, 1)
 
-        crf_b, pr_b = deepdream.resolve_video_quality("balanced")
+        crf_b, pr_b, sc_b = deepdream.resolve_video_quality("balanced")
         self.assertEqual(crf_b, 17)
         self.assertEqual(pr_b, "medium")
+        self.assertEqual(sc_b, 1)
 
-        crf_l, pr_l = deepdream.resolve_video_quality("lossless")
-        self.assertEqual(crf_l, 0)
+        crf_l, pr_l, sc_l = deepdream.resolve_video_quality("lossless")
+        self.assertEqual(crf_l, 12)
         self.assertEqual(pr_l, "medium")
+        self.assertEqual(sc_l, 2)
 
-        # Explicit CRF override
-        crf_c, pr_c = deepdream.resolve_video_quality("balanced", crf=10)
+        # Explicit CRF override does not change geometry (scale stays from the name)
+        crf_c, pr_c, sc_c = deepdream.resolve_video_quality("balanced", crf=10)
         self.assertEqual(crf_c, 10)
+        self.assertEqual(sc_c, 1)
+        crf_lc, _, sc_lc = deepdream.resolve_video_quality("lossless", crf=0)
+        self.assertEqual(crf_lc, 0)
+        self.assertEqual(sc_lc, 2)
 
         # Out-of-range validation
         with self.assertRaises(ValueError):
@@ -1859,9 +1909,9 @@ class TestGuidedAndVideoFeatures(unittest.TestCase):
             Image.new("RGB", (64, 64), color=(255, 0, 0)).save(os.path.join(frames, "o1_i1.png"))
             Image.new("RGB", (64, 64), color=(0, 255, 0)).save(os.path.join(frames, "o1_i2.png"))
 
-            # Lossless compilation (CRF 0)
+            # Lossless preset compilation (CRF 12)
             out_lossless = os.path.join(td, "tl_lossless.mp4")
-            deepdream.compile_timelapse(frames, out_lossless, fps=10, crf=0)
+            deepdream.compile_timelapse(frames, out_lossless, fps=10, crf=12)
             self.assertTrue(os.path.isfile(out_lossless))
             self.assertGreater(os.path.getsize(out_lossless), 0)
 
@@ -2120,9 +2170,10 @@ class TestVideoProcessingLogic(unittest.TestCase):
         with self.assertRaises(ValueError):
             deepdream.resolve_video_quality("balanced", crf=None, preset="ultrafast-invalid")
         for preset in sorted(deepdream.FFMPEG_PRESETS):
-            crf, got = deepdream.resolve_video_quality("balanced", crf=None, preset=preset)
+            crf, got, scale = deepdream.resolve_video_quality("balanced", crf=None, preset=preset)
             self.assertEqual(crf, 17)
             self.assertEqual(got, preset)
+            self.assertEqual(scale, 1)
 
     def test_main_value_error_is_friendly(self):
         script = os.path.abspath(__file__)
@@ -2446,6 +2497,15 @@ class TestResumeCompatibility(unittest.TestCase):
         self._zoom(3, resume=True)
         self.assertTrue(os.path.isfile(os.path.join(self.frames_dir, "frame_000003.png")))
         self.assertEqual(os.path.getmtime(f1), mtime)
+
+    def test_zoom_resume_refuses_shorter_sequence_and_keeps_outputs(self):
+        self._zoom(3)
+        original = {path.name: path.read_bytes() for path in Path(self.frames_dir).iterdir()}
+        with self.assertRaisesRegex(SystemExit, "beyond --zoom-frames"):
+            self._zoom(1, resume=True)
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in Path(self.frames_dir).iterdir()}, original
+        )
 
     def test_zoom_resume_refuses_different_size_and_keeps_meta(self):
         self._zoom(2)

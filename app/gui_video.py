@@ -55,6 +55,7 @@ class VideoExportMixin:
     _out_dir: tk.StringVar
     _timelapse: tk.BooleanVar
     _video_quality_var: tk.StringVar
+    _video_quality_preset: str
     _video_crf: tk.IntVar
     _tracker: ProgressTracker
     _encode_queue: queue.Queue
@@ -110,6 +111,7 @@ class VideoExportMixin:
         self._sidebar_save_video_btn = None
         self._video_frames_label = None
         self._video_quality_var = tk.StringVar(value="Balanced")
+        self._video_quality_preset = "Balanced"
         self._video_crf = tk.IntVar(value=17)
         self._encode_proc = None
         # Encode-subprocess events (log lines and completion) as tuples, drained
@@ -172,7 +174,7 @@ class VideoExportMixin:
             "Video encoding preset:\n"
             "• Small: Fast export, compact file (CRF 28).\n"
             "• Balanced: High quality, crisp detail (CRF 17, default).\n"
-            "• Lossless: No compression loss (CRF 0).",
+            "• Lossless (visually): Maximum detail (CRF 12, 2× resolution / 4× pixels).",
         )
 
         self._video_quality_info_lbl = ModernLabel(
@@ -194,8 +196,9 @@ class VideoExportMixin:
             0,
             51,
             True,
-            tip="H.264 video quality (0-51; lower = better). 0 = lossless (exact pixels), "
-            "17 = visually perfect (recommended), 28 = compact file for easy sharing.",
+            tip="H.264 video quality (0-51; lower = better). "
+            "12 = Lossless (visually, 2× resolution), "
+            "17 = Balanced (recommended), 28 = Small for easy sharing.",
             curve=1.0,
             step=1,
         )
@@ -229,12 +232,13 @@ class VideoExportMixin:
             "Export the current dreamed frame sequence to an .mp4 at the "
             "quality selected above.\n"
             "Repeat as often as you like (once Small for sharing, once "
-            "Lossless for archival) without re-running the dream.",
+            "Lossless for archival detail) without re-running the dream.",
         )
         self._video_quality_frame.grid_remove()
 
     def _on_video_quality_seg_change(self, value: str):
         if value in VIDEO_QUALITY_INFO:
+            self._video_quality_preset = value
             self._video_crf.set(VIDEO_QUALITY_INFO[value]["crf"])
             self._video_quality_var.set(value)
             if self._video_quality_info_lbl is not None:
@@ -252,8 +256,15 @@ class VideoExportMixin:
         except (ValueError, tk.TclError):
             return
 
-        name = _CRF_TO_QUALITY.get(crf)
+        current = self._video_quality_preset
+        name: str | None
+        if current in VIDEO_QUALITY_INFO and VIDEO_QUALITY_INFO[current]["crf"] == crf:
+            # Keep the chosen preset (e.g. Lossless, 2x) when its own CRF is set.
+            name = current
+        else:
+            name = _CRF_TO_QUALITY.get(crf)
         if name is not None:
+            self._video_quality_preset = name
             desc = VIDEO_QUALITY_INFO[name]["desc"]
         else:
             name = "Custom"
@@ -263,7 +274,10 @@ class VideoExportMixin:
                 qual = "High / Balanced"
             else:
                 qual = "Compressed / Small"
-            desc = f"Custom: {qual} (CRF {crf}, 0=lossless, 51=max compression)"
+            geometry = ""
+            if VIDEO_QUALITY_INFO[self._video_quality_preset]["scale"] > 1:
+                geometry = f", {self._video_quality_preset} 2× resolution"
+            desc = f"Custom: {qual} (CRF {crf}{geometry}, lower = higher quality)"
 
         if self._video_quality_seg is not None:
             self._video_quality_seg.set(name)
@@ -372,6 +386,7 @@ class VideoExportMixin:
             quality=self._video_quality_var.get() or "",
             crf=self._get_current_crf(),
             audio_from=audio_from,
+            preset=self._video_quality_preset,
         )
 
     def _build_encode_cmd(self, frames_dir, out_path, fps, audio_from=None):

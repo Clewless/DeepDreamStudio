@@ -1,6 +1,8 @@
 """Media boundary regressions: orientation and preservation of completed output."""
 
+import errno
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import numpy as np
@@ -58,7 +60,7 @@ def test_locked_destination_preserves_output_according_to_policy(tmp_path: Path,
         else:
             with pytest.raises(PermissionError, match="locked"):
                 if kind == "video":
-                    media_io.publish_video(temporary, destination)
+                    media_io.publish_media(temporary, destination)
                 else:
                     media_io.save_image(media_io.pil_to_tensor(Image.fromarray(frame)), destination)
 
@@ -70,3 +72,62 @@ def test_locked_destination_preserves_output_according_to_policy(tmp_path: Path,
     else:
         with Image.open(temporary) as completed:
             np.testing.assert_array_equal(np.asarray(completed), frame)
+
+    if kind != "preview":
+        # The GUI sweeps on failure, stale completion, Stop, and close using
+        # this same method. Its sweep must keep the engine's recovery output.
+        import os
+
+        from app.gui import DeepDreamGUI
+
+        partial = tmp_path / f"unfinished.p{os.getpid()}.tmp"
+        partial.write_bytes(b"partial")
+        DeepDreamGUI._cleanup_job_temps(mock.Mock(), str(tmp_path), os.getpid())
+        assert temporary.exists()
+        assert not partial.exists()
+
+
+def test_successful_publication_leaves_no_recovery_marker(tmp_path: Path) -> None:
+    destination = tmp_path / "image.png"
+    media_io.save_image(media_io.pil_to_tensor(Image.new("RGB", (4, 4))), destination)
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_sidecar_failure_does_not_discard_a_completed_video(tmp_path: Path) -> None:
+    destination = tmp_path / "video.mp4"
+    temporary = Path(media_io.atomic_tmp_path(destination))
+    temporary.write_bytes(b"completed encode")
+
+    name_too_long = OSError(errno.ENAMETOOLONG, "File name too long")
+    with mock.patch.object(media_io, "open", side_effect=name_too_long, create=True):
+        media_io.publish_media(temporary, destination)
+
+    assert destination.read_bytes() == b"completed encode"
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_locked_destination_retries_a_failed_recovery_marker(tmp_path: Path) -> None:
+    destination = tmp_path / "video.mp4"
+    temporary = Path(media_io.atomic_tmp_path(destination))
+    temporary.write_bytes(b"completed encode")
+    marker = Path(f"{temporary}.complete")
+    real_open = open
+    attempts = {"count": 0}
+
+    def flaky_open(*args: Any, **kwargs: Any):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError(errno.ENAMETOOLONG, "File name too long")
+        return real_open(*args, **kwargs)
+
+    with (
+        mock.patch.object(media_io, "open", side_effect=flaky_open, create=True),
+        mock.patch.object(media_io.os, "replace", side_effect=PermissionError("locked")),
+    ):
+        with pytest.raises(PermissionError, match="locked"):
+            media_io.publish_media(temporary, destination)
+
+    # The retry must leave the sidecar cleanup looks for, so the preserved
+    # output survives a later GUI sweep.
+    assert marker.exists()
+    assert temporary.read_bytes() == b"completed encode"

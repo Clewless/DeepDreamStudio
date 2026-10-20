@@ -91,6 +91,10 @@ deepdream-studio
 
 The installed version and the repository can coexist; the launchers always use the local `app/` package.
 
+The installed GUI defaults to `~/DeepDream Studio/out` (inside your user home
+folder). Source launchers use the repository's `out` folder. You can choose a
+different output folder in the GUI.
+
 Source/launcher installs use the tested direct-dependency baseline in
 `constraints-runtime.txt`. Standard wheel installs use compatibility ranges;
 see [Contributing](CONTRIBUTING.md#dependencies) for reproducible setup and updates.

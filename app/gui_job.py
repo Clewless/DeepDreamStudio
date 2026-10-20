@@ -22,27 +22,31 @@ def _as_int(value: Any) -> int:
 _VIDEO_QUALITY_DESCRIPTIONS = {
     "Small": "Small: compact file, medium compression (CRF {crf}, fast)",
     "Balanced": "Balanced: high quality (CRF {crf}, recommended)",
-    "Lossless": "Lossless: no compression loss (CRF {crf})",
+    "Lossless": "Lossless (visually): maximum detail (CRF {crf}, 2× resolution)",
 }
 
 
 class _VideoQualityInfo(TypedDict):
     crf: int
+    scale: int
     desc: str
 
 
 VIDEO_QUALITY_INFO: dict[str, _VideoQualityInfo] = {
     name: {
         "crf": VIDEO_QUALITY_PRESETS[name.lower()]["crf"],
+        "scale": VIDEO_QUALITY_PRESETS[name.lower()]["scale"],
         "desc": template.format(crf=VIDEO_QUALITY_PRESETS[name.lower()]["crf"]),
     }
     for name, template in _VIDEO_QUALITY_DESCRIPTIONS.items()
 }
 
-# Reverse lookup: CRF value -> quality preset name
+# Reverse lookup: CRF value -> quality preset name. Only 1x presets: a 2x preset
+# (Lossless) is chosen by name, so a bare CRF value never changes resolution.
 _CRF_TO_QUALITY: dict[int, str] = {}
 for _name, _info in VIDEO_QUALITY_INFO.items():
-    _CRF_TO_QUALITY.setdefault(_info["crf"], _name)
+    if _info["scale"] == 1:
+        _CRF_TO_QUALITY.setdefault(_info["crf"], _name)
 
 
 @dataclass
@@ -71,6 +75,8 @@ class GenerationJob:
     video_blend: float = 0.5
     video_quality: Literal["Small", "Balanced", "Lossless", "Custom"] = "Balanced"
     video_crf: int = 17
+    # Geometry preset retained when the CRF slider marks the quality "Custom".
+    video_preset: Literal["Small", "Balanced", "Lossless"] | None = None
     guidance_mode: Literal["Unguided", "Guide Image", "Target Class"] = "Unguided"
     guide_path: str | None = None
     target_class: str | None = None
@@ -147,7 +153,7 @@ class GenerationJob:
         if separated_save and self.frames_dir:
             cmd += ["--frames-dir", self.frames_dir, "--frames-only"]
         elif self.mode in ("Dream Zoom", "Dream Video") or self.timelapse:
-            vq_lower = (self.video_quality or "").lower()
+            vq_lower = (self.video_preset or self.video_quality or "").lower()
             if vq_lower in ("small", "balanced", "lossless"):
                 cmd += ["--video-quality", vq_lower]
             if self.video_crf is not None:

@@ -754,9 +754,84 @@ class TestGUIComparison(unittest.TestCase):
             job = mock.Mock()
             job.image_path = path
             self.app._load_input_image_for_job(job)
-            self.assertIsNot(self.app._input_pil, first)
-            assert self.app._input_pil is not None
-            self.assertEqual(self.app._input_pil.getpixel((0, 0)), (200, 100, 50))
+        self.assertIsNot(self.app._input_pil, first)
+        assert self.app._input_pil is not None
+        self.assertEqual(self.app._input_pil.getpixel((0, 0)), (200, 100, 50))
+
+
+@pytest.mark.gui
+class TestDropZoneContextMenu(unittest.TestCase):
+    """Input drop-zone context menu actions: Clear and Undo of loaded media."""
+
+    def setUp(self):
+        try:
+            self.app = gui.DeepDreamGUI()
+        except Exception as exc:
+            if "no display name" in str(exc).lower() or "tcl" in str(exc).lower():
+                self.skipTest("Tk display not available")
+            raise
+
+    def tearDown(self):
+        if hasattr(self, "app"):
+            self.app.destroy()
+
+    @staticmethod
+    def _make_png(directory, name, color=(10, 20, 30)):
+        from PIL import Image
+
+        path = os.path.join(directory, name)
+        Image.new("RGB", (12, 8), color=color).save(path)
+        return path
+
+    def test_clear_input_resets_state_and_restores_placeholder(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._make_png(d, "input.png")
+            self.app._load_image_preview(path)
+            self.assertEqual(self.app._image_path.get(), path)
+
+            self.app._clear_input_image()
+
+            self.assertEqual(self.app._image_path.get(), "")
+            self.assertIsNone(self.app._input_pil)
+            self.assertIsNone(self.app._input_pil_path)
+            self.assertIsNone(self.app._input_pil_mtime)
+            self.assertIsNone(self.app._drop_zone.image)
+            self.assertIn("drop", str(self.app._drop_zone.cget("text")))
+            self.assertIn(path, self.app._input_history)
+
+    def test_undo_restores_input_cleared_by_clear(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._make_png(d, "input.png")
+            self.app._load_image_preview(path)
+
+            self.app._clear_input_image()
+            self.assertEqual(self.app._image_path.get(), "")
+
+            self.app._undo_input_image()
+            self.assertEqual(self.app._image_path.get(), path)
+            self.assertIsNotNone(self.app._input_pil)
+
+    def test_undo_walks_back_previous_loaded_input(self):
+        with tempfile.TemporaryDirectory() as d:
+            first = self._make_png(d, "a.png", color=(10, 0, 0))
+            second = self._make_png(d, "b.png", color=(0, 10, 0))
+
+            self.app._load_image_preview(first)
+            self.app._load_image_preview(second)
+            self.assertEqual(self.app._image_path.get(), second)
+
+            self.app._undo_input_image()
+            self.assertEqual(self.app._image_path.get(), first)
+
+            self.app._undo_input_image()
+            self.assertEqual(self.app._image_path.get(), "")
+
+    def test_clear_and_undo_are_noops_when_nothing_to_do(self):
+        self.app._clear_input_image()
+        self.assertEqual(self.app._input_history, [])
+
+        self.app._undo_input_image()
+        self.assertEqual(self.app._image_path.get(), "")
 
 
 class TestSliderMath(unittest.TestCase):
@@ -1308,6 +1383,43 @@ class TestJobCleanup(unittest.TestCase):
             for name in kept:
                 self.assertTrue(os.path.exists(os.path.join(d, name)), name)
 
+    def test_cleanup_job_temps_keeps_completed_and_removes_stale_markers(self):
+        pid = 4242
+        with tempfile.TemporaryDirectory() as d:
+            # Publication still pending: temp + sidecar must survive.
+            pending = f"a.mp4.p{pid}.temp.mp4"
+            Path(d, pending).write_bytes(b"x")
+            Path(d, pending + ".complete").write_bytes(b"")
+            # Replacement finished but sidecar was left behind: remove the sidecar only.
+            stale = f"b.png.p{pid}.tmp"
+            Path(d, stale + ".complete").write_bytes(b"")
+            # Plain unmarked temp from this pid: removed as before.
+            plain = f"c.png.p{pid}.tmp"
+            Path(d, plain).write_bytes(b"x")
+            self.app._cleanup_job_temps(d, pid)
+            self.assertTrue(os.path.exists(os.path.join(d, pending)))
+            self.assertTrue(os.path.exists(os.path.join(d, pending + ".complete")))
+            self.assertFalse(os.path.exists(os.path.join(d, stale + ".complete")))
+            self.assertFalse(os.path.exists(os.path.join(d, plain)))
+
+    def test_cleanup_job_temps_removes_orphan_markers_from_other_pids(self):
+        with tempfile.TemporaryDirectory() as d:
+            # Marker left by a killed earlier process whose temp is already gone.
+            orphan = "old.mp4.p9999.temp.mp4.complete"
+            Path(d, orphan).write_bytes(b"")
+            # Marker for a temp that still exists must survive, whatever its pid.
+            live = "live.png.p9999.tmp"
+            Path(d, live).write_bytes(b"x")
+            Path(d, live + ".complete").write_bytes(b"")
+            # Non-temp names are never touched.
+            unrelated = "notes.complete"
+            Path(d, unrelated).write_bytes(b"")
+            self.app._cleanup_job_temps(d, 4242)
+            self.assertFalse(os.path.exists(os.path.join(d, orphan)))
+            self.assertTrue(os.path.exists(os.path.join(d, live)))
+            self.assertTrue(os.path.exists(os.path.join(d, live + ".complete")))
+            self.assertTrue(os.path.exists(os.path.join(d, unrelated)))
+
     def test_cleanup_job_temps_tolerates_missing_input(self):
         self.app._cleanup_job_temps("no/such/dir", 123)  # must not raise
         self.app._cleanup_job_temps("", None)
@@ -1487,14 +1599,44 @@ class TestVideoQualitySettings(unittest.TestCase):
         # Switch to Lossless
         self.app._on_video_quality_seg_change("Lossless")
         self.assertEqual(self.app._video_quality_var.get(), "Lossless")
-        self.assertEqual(self.app._video_crf.get(), 0)
-        self.assertIn("CRF 0", self.app._video_quality_info_lbl.cget("text"))
+        self.assertEqual(self.app._video_crf.get(), 12)
+        self.assertIn("CRF 12", self.app._video_quality_info_lbl.cget("text"))
 
         # Switch to Custom via CRF variable
-        self.app._video_crf.set(12)
+        self.app._video_crf.set(10)
         self.assertEqual(self.app._video_quality_var.get(), "Custom")
         self.assertEqual(self.app._video_quality_seg.get(), "Custom")
-        self.assertIn("CRF 12", self.app._video_quality_info_lbl.cget("text"))
+        self.assertIn("CRF 10", self.app._video_quality_info_lbl.cget("text"))
+
+    def test_custom_crf_keeps_the_selected_preset_geometry(self):
+        self.app._on_video_quality_seg_change("Lossless")
+        self.app._video_crf.set(10)
+        self.assertEqual(self.app._video_quality_var.get(), "Custom")
+        self.assertEqual(self.app._video_quality_preset, "Lossless")
+        cmd = self.app._build_export_request("frames", "out.mp4", 30).build_cmd()
+        self.assertEqual(cmd[cmd.index("--video-quality") + 1], "lossless")
+        self.assertEqual(cmd[cmd.index("--crf") + 1], "10")
+
+        # Returning to a named preset CRF switches the retained geometry too.
+        self.app._on_video_quality_seg_change("Balanced")
+        self.assertEqual(self.app._video_quality_preset, "Balanced")
+        self.app._video_crf.set(10)
+        cmd = self.app._build_export_request("frames", "out.mp4", 30).build_cmd()
+        self.assertEqual(cmd[cmd.index("--video-quality") + 1], "balanced")
+
+    def test_custom_crf_12_does_not_select_lossless_geometry(self):
+        self.app._on_video_quality_seg_change("Balanced")
+        self.app._video_crf.set(12)
+        self.assertEqual(self.app._video_quality_var.get(), "Custom")
+        cmd = self.app._build_export_request("frames", "out.mp4", 30).build_cmd()
+        self.assertEqual(cmd[cmd.index("--video-quality") + 1], "balanced")
+        self.assertEqual(cmd[cmd.index("--crf") + 1], "12")
+
+        # The Lossless button still selects the 2x preset at CRF 12.
+        self.app._on_video_quality_seg_change("Lossless")
+        self.assertEqual(self.app._video_quality_var.get(), "Lossless")
+        cmd = self.app._build_export_request("frames", "out.mp4", 30).build_cmd()
+        self.assertEqual(cmd[cmd.index("--video-quality") + 1], "lossless")
 
     def test_video_quality_visibility_toggle(self):
         # Single Image mode without timelapse -> hidden
@@ -1534,13 +1676,13 @@ class TestVideoQualitySettings(unittest.TestCase):
             out_dir="out",
             mode="Dream Zoom",
             video_quality="Lossless",
-            video_crf=0,
+            video_crf=12,
         )
         cmd_zoom = job_zoom.build_cmd()
         self.assertIn("--video-quality", cmd_zoom)
         self.assertIn("lossless", cmd_zoom)
         self.assertIn("--crf", cmd_zoom)
-        self.assertIn("0", cmd_zoom)
+        self.assertEqual(cmd_zoom[cmd_zoom.index("--crf") + 1], "12")
 
         # Single image with Timelapse and Small preset
         job_tl = GenerationJob(

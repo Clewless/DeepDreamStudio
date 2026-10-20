@@ -60,7 +60,7 @@ Model weights download from PyTorch on first use.
 | `--video` | Off | Process an input video, preserving its audio when possible. |
 | `--video-blend` | `0.5` | Previous-dream weight for video blending; higher values retain more of the previous frame. |
 | `--frames` | Off | Save iteration frames as PNGs. Existing matching frames require `--clear-frames`. |
-| `--clear-frames` | Off | With `--frames` or `--timelapse`, explicitly remove existing iteration frames in `--frames-dir` before writing replacements. Other files in the directory make the run fail safely. |
+| `--clear-frames` | Off | With `--frames` or `--timelapse`, explicitly remove existing iteration frames in `--frames-dir` before writing replacements; with `--zoom` or `--video`, replace a saved frame sequence in the frame folder, which requires `--frames-dir` or `--frames-only`; only the first video frame is validated before the old sequence is removed. Other files in the directory make the run fail safely. Cannot be combined with `--resume`. |
 | `--frames-dir` | None | Dedicated frame output directory; `--frames` defaults to `out/frames`, while batch runs use per-run directories. |
 | `--frames-only` | Off | Generate zoom/video frames without encoding an MP4. |
 | `--encode-frames DIR` | None | Encode an existing frame sequence without running the dream again. |
@@ -69,8 +69,8 @@ Model weights download from PyTorch on first use.
 | `--no-cuda` / `--cpu` | Off | Force CPU execution. |
 | `--out` | `out` | Output directory; `--encode-frames` also accepts an explicit MP4 path. |
 | `--name` | Input filename | Output filename stem. |
-| `--video-quality` | `balanced` | H.264 preset: `small` (CRF 28), `balanced` (17), or `lossless` (0). |
-| `--crf` | Preset value | Explicit H.264 CRF from 0 to 51; overrides the quality preset. |
+| `--video-quality` | `balanced` | H.264 preset: `small` (CRF 28), `balanced` (17), or `lossless` (visually lossless; 12, 2× resolution / 4× pixels). |
+| `--crf` | Preset value | Explicit H.264 CRF from 0 to 51; overrides the quality preset's CRF (geometry stays at the preset's scale). |
 | `--seed` | None | Seed Python and PyTorch RNGs; in a batch each image uses `--seed` plus its position, so a result does not depend on how many other images are in the run. Some GPU operations may still vary. |
 | `--preview-file` | None | Write intermediate previews for the GUI. |
 
@@ -99,7 +99,33 @@ python -m app.deepdream --encode-frames out\zoom_seq --out out\preview.mp4 --vid
 python -m app.deepdream --encode-frames out\zoom_seq --out out\master.mp4 --video-quality lossless
 ```
 
-Use an empty, dedicated `--frames-dir` for still-image iteration frames. `--clear-frames` replaces matching iteration PNGs only after checking that the directory contains no unexpected files.
+Use an empty, dedicated `--frames-dir` for still-image iteration frames. `--clear-frames` replaces matching iteration PNGs only after checking that the directory contains no unexpected files. A completed iteration temp kept for recovery (`o*_i*.png.p*.tmp` plus its `.complete` sidecar, left when a locked destination blocked publishing) is never removed by `--clear-frames` or the automatic sweeps; delete it manually once recovered.
+
+Fresh zoom/video runs also require an empty frame folder, so a new sequence can
+never be mixed with saved frames. Interrupted atomic-save temps
+(`.frame_*.tmp.png`, `meta.json.tmp`) are swept automatically and never block a
+run. To continue an interrupted sequence, use `--resume` with its original
+settings; to deliberately start over in the same folder, add `--clear-frames`,
+which removes the saved frames and `meta.json` and refuses to touch anything
+else in the directory.
+
+The `lossless` preset uses CRF 12 at 2× width and height (4× pixels) in
+standard YUV 4:2:0, so chroma density after subsampling matches native-resolution
+full-chroma detail. Saved PNG frames stay at the dreamed native size; only the
+encoded MP4 grows. Custom `--crf` values never change geometry — they use the
+named preset's scale (1× for `small`/`balanced`, 2× for `lossless`). Because all
+output is 4:2:0, even CRF 0 is not bit-exact.
+
+**Frame-size limit.** H.264 Level 5.1 caps a frame at 36,864 macroblocks (about
+9.4 megapixels). Hardware decoders are often rated only up to that level and may
+refuse larger frames. `lossless` doubles each side, so its MP4 exceeds the limit
+when the dreamed frame is larger than about 2.36 megapixels: a square frame above
+1536 px, or a 3:2 frame at Max Size 2048 (doubled to 4096×2730). The default size
+of 512 is unaffected. Software players such as ffmpeg should still play these
+files, but this has not been tested. The 1× presets stay under the limit at any
+Max Size up to 2048. A large `--size 0` (native resolution) can exceed it with any
+preset. For a file that must play on hardware-limited devices, use `balanced` and
+keep the dreamed frame under the limit.
 
 ## Models and layers
 

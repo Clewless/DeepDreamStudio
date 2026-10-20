@@ -3,9 +3,11 @@
 import queue
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
+from app import gui_helpers
 from app.gui_helpers import PROC_DONE_PREFIX
 from app.gui_process import read_encode_output, read_generation_output, start_cli_process
 from app.gui_viewer import ViewerGeometry
@@ -99,3 +101,59 @@ def test_export_stream_reports_failure_and_closes_pipe(tmp_path: Path) -> None:
 def test_process_start_failure_is_not_hidden(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         start_cli_process([str(tmp_path / "missing-interpreter")], tmp_path)
+
+
+def test_custom_crf_keeps_the_retained_preset_geometry_in_job_command() -> None:
+    from app.gui_job import GenerationJob
+
+    job = GenerationJob(
+        id=1,
+        image_path="input.jpg",
+        model_key="googlenet",
+        layer_spec="inception4c",
+        iterations=2,
+        octaves=0,
+        octave_scale=1.4,
+        lr=0.03,
+        size=512,
+        jitter=0,
+        out_dir="out",
+        mode="Dream Zoom",
+        video_quality="Custom",
+        video_crf=10,
+        video_preset="Lossless",
+    )
+    cmd = job.build_cmd()
+    assert cmd[cmd.index("--video-quality") + 1] == "lossless"
+    assert cmd[cmd.index("--crf") + 1] == "10"
+
+
+def test_launcher_outputs_stay_beside_source(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").touch()
+    (tmp_path / "Launch.sh").touch()
+    with mock.patch.object(gui_helpers, "ROOT", tmp_path):
+        assert gui_helpers.resolve_out_dir("") == str(tmp_path / "out")
+        assert gui_helpers.resolve_out_dir("artwork") == str(tmp_path / "artwork")
+
+
+def test_windows_only_checkout_outputs_stay_beside_source(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").touch()
+    (tmp_path / "Launch.bat").touch()
+    with mock.patch.object(gui_helpers, "ROOT", tmp_path):
+        assert gui_helpers.output_base_dir() == tmp_path
+
+
+def test_installed_outputs_use_home_instead_of_site_packages(tmp_path: Path) -> None:
+    package_root = tmp_path / "site-packages"
+    package_root.mkdir()
+    home = tmp_path / "home"
+    with (
+        mock.patch.object(gui_helpers, "ROOT", package_root),
+        mock.patch.object(Path, "home", return_value=home),
+    ):
+        base = home / "DeepDream Studio"
+        assert gui_helpers.resolve_out_dir("") == str(base / "out")
+        assert gui_helpers.resolve_out_dir("artwork") == str(base / "artwork")
+        explicit = tmp_path / "chosen"
+        assert gui_helpers.resolve_out_dir(str(explicit)) == str(explicit)
+        assert not list(package_root.iterdir())

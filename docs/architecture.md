@@ -64,6 +64,23 @@ anchoring, and slide-reveal interactions share that mapping.
 
 Final images and videos are published using sibling temporary files and atomic
 replacement. Locked destinations preserve the completed temporary output.
+Completed publication candidates carry a `.complete` sidecar until replacement
+succeeds, when the sidecar can be written; publication proceeds without one if it
+cannot. GUI cleanup skips these recoverable outputs, including on Stop/close,
+as do the engine's temp sweeps and `--clear-frames`; only manual deletion
+removes a preserved output. Sidecars whose temp file is already gone are
+removed by cleanup. A hard kill during publication leaves the temp file and
+sidecar for manual recovery.
+Fresh zoom/video generation requires an empty frame directory; `--resume` is the
+explicit path for continuing a saved sequence with compatible settings, and
+`--clear-frames` the explicit path for deliberately replacing one. Only files
+this app writes (frame PNGs, iteration PNGs, `meta.json`) are ever cleared.
+Atomic-save temps an interrupted write left behind are swept before that check,
+so a killed run cannot block the folder it wrote into; a temp whose
+`.complete` sidecar proves it finished is kept for manual recovery instead.
+Video input is decoded and size-checked through its first frame before
+`--clear-frames` may delete a saved sequence; later decode failures can still
+leave the old sequence cleared.
 Sequence metadata records the settings needed to validate a resumed run.
 Cleanup must remain scoped to a job's own files and must not remove unexpected
 files from a user-selected directory.

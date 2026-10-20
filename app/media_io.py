@@ -105,18 +105,57 @@ def remove_stale_temps(*paths: MediaPath | None) -> None:
                 pass
 
 
-def publish_video(temp_out: MediaPath, out_path: MediaPath, what: str = "video") -> None:
-    """Publish a completed encode; preserve it if the destination is locked."""
+def _write_completion_marker(marker: str) -> bool:
+    """Write the empty recovery sidecar; True when it can be created."""
+    try:
+        with open(marker, "w", encoding="utf-8"):
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def publish_media(temp_out: MediaPath, out_path: MediaPath, what: str = "video") -> None:
+    """Publish a completed image or video via atomic replacement.
+
+    A ``<temp>.complete`` sidecar is written before replacement and removed once
+    it succeeds. The sidecar is best-effort: if it cannot be created, replacement
+    still runs, so a finished output is not discarded for it. If the destination
+    is locked, the sidecar and temp file are kept so the finished output can be
+    recovered; GUI cleanup and the engine's temp sweeps skip them. If the
+    sidecar could not be written earlier, it is retried before giving up, since
+    cleanup would otherwise delete the preserved temp. A hard kill mid-publish
+    also leaves them behind for manual recovery.
+    """
+    marker = os.fspath(temp_out) + ".complete"
+    marker_written = _write_completion_marker(marker)
     try:
         os.replace(temp_out, out_path)
     except PermissionError:
+        if not marker_written:
+            # Cleanup deletes unmarked temps as partial, so retry now that the
+            # destination is known to be the blocker; the first attempt may
+            # have failed transiently.
+            marker_written = _write_completion_marker(marker)
         print(
             f"Warning: Destination file '{out_path}' is locked by another program. "
             f"Completed {what} preserved at '{temp_out}'.",
             file=sys.stderr,
             flush=True,
         )
+        if not marker_written:
+            print(
+                f"Warning: Could not write recovery marker '{marker}'; "
+                "cleanup may remove the preserved output.",
+                file=sys.stderr,
+                flush=True,
+            )
         raise
+    except BaseException:
+        remove_stale_temps(marker)
+        raise
+    else:
+        remove_stale_temps(marker)
 
 
 def save_frame_atomic(frame_np: RGBFrame, frames_dir: MediaPath, index: int) -> None:
@@ -145,15 +184,9 @@ def save_image(t: Tensor, path: MediaPath, warn_on_overwrite: bool = False) -> N
     try:
         img.save(tmp_path, format=fmt)
         try:
-            os.replace(tmp_path, path)
+            publish_media(tmp_path, path, "image")
         except PermissionError:
             keep_temp = True
-            print(
-                f"Warning: Destination file '{path}' is locked by another process. "
-                f"Rendered image preserved at '{tmp_path}'.",
-                file=sys.stderr,
-                flush=True,
-            )
             raise
     except BaseException:
         if not keep_temp:

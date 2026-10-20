@@ -56,7 +56,7 @@ from .media_io import (
 from .media_io import STD as STD
 from .media_io import atomic_tmp_path as _atomic_tmp_path
 from .media_io import load_pil_image as load_pil_image
-from .media_io import publish_video as _publish_video
+from .media_io import publish_media as _publish_media
 from .media_io import remove_stale_temps as _remove_stale_temps
 from .media_io import save_frame_atomic as _save_frame_atomic
 from .model_data import (
@@ -64,6 +64,7 @@ from .model_data import (
     MIN_TORCH_VERSION,
     MODEL_MIN_SIZE,
     VIDEO_EXTENSIONS,
+    VIDEO_FRAMES_META,
     VIDEO_QUALITY_PRESETS,
     build_systematic_video_name,
     filename_stem_error,
@@ -464,12 +465,12 @@ def _first_video_frame_size(video_path):
     return (int(first.shape[1]), int(first.shape[0]))
 
 
-def _append_saved_video_frames(writer, frames_dir, count):
+def _append_saved_video_frames(writer, frames_dir, count, scale=1):
     """Seed a resumed MP4 encode with the frames that were already generated."""
     for frame_idx in range(1, count + 1):
         frame_path = os.path.join(frames_dir, f"frame_{frame_idx:06d}.png")
         with Image.open(frame_path) as frame:
-            writer.append_data(np.asarray(frame.convert("RGB")))
+            writer.append_data(_upscale_frame(frame.convert("RGB"), scale))
 
 
 def _video_output_params(crf, preset):
@@ -491,24 +492,210 @@ def _open_video_writer(path, fps, output_params):
         path,
         fps=fps,
         codec="libx264",
+        # Always 4:2:0 for broad player support. The lossless preset recovers
+        # chroma detail through 2x resolution, not through 4:4:4 output.
+        pixelformat="yuv420p",
         macro_block_size=1,
         **kwargs,
     )
 
 
+def _upscale_frame(img, scale):
+    """Lanczos-upscale a PIL image or HxWx3 array for the encode stream.
+
+    Always returns an ndarray. scale <= 1 converts without resizing.
+    Only the writer path uses this: saved PNG frames stay at the dreamed native size.
+    """
+    if scale is None or scale <= 1:
+        return img if isinstance(img, np.ndarray) else np.asarray(img)
+    if isinstance(img, np.ndarray):
+        pil = Image.fromarray(img)
+    else:
+        pil = img
+    w, h = pil.size
+    return np.asarray(pil.resize((w * scale, h * scale), Image.Resampling.LANCZOS))
+
+
+def prepare_video_frames_dir(frames_dir, resume=False, clear=False):
+    """Keep a fresh sequence from being mixed with a saved one.
+
+    Atomic-save temps an interrupted write may have left behind are swept
+    first: they are never part of a sequence, so they must not block the run
+    that would overwrite them anyway. Everything else is the user's, and only
+    --clear-frames may remove it -- except a finished temp kept for recovery
+    (its ``.complete`` sidecar present), which only manual deletion removes.
+    """
+    if not frames_dir:
+        return
+    ensure_output_dir(frames_dir)
+    remove_sequence_temps(frames_dir)
+    if resume:
+        return
+    entries = sorted(os.listdir(frames_dir))
+    if not entries:
+        return
+    if clear:
+        clear_video_frames(frames_dir, entries)
+        return
+    raise _non_empty_frames_error(frames_dir, entries)
+
+
+def _non_empty_frames_error(frames_dir, entries) -> SystemExit:
+    return SystemExit(
+        f"Error: frames directory '{frames_dir}' is not empty "
+        f"({len(entries)} file(s), for example '{entries[0]}').\n"
+        "Use an empty folder for a new sequence, pass --resume with the "
+        "original settings to continue the saved one, or pass --clear-frames "
+        "to replace it."
+    )
+
+
+def check_video_frames_dir_free(frames_dir, resume=False, clear=False) -> None:
+    """Read-only preflight: fail before model load if prepare_video_frames_dir would refuse.
+
+    Names the temp sweep would remove do not count, matching prepare_video_frames_dir.
+    """
+    if not frames_dir or resume or clear or not os.path.isdir(frames_dir):
+        return
+    entries = sorted(
+        name
+        for name in os.listdir(frames_dir)
+        if not (_is_sweepable_temp(name) and not _is_preserved_output(name, frames_dir))
+    )
+    if entries:
+        raise _non_empty_frames_error(frames_dir, entries)
+
+
+def clear_video_frames(frames_dir, entries=None) -> None:
+    """Delete a saved sequence so a new one can start in the same folder.
+
+    Refuses to touch anything this app did not write, so a mistyped
+    --frames-dir cannot cost the user unrelated files. Outputs preserved for
+    recovery (temp plus ``.complete`` sidecar) are this app's, but only manual
+    deletion may remove them.
+    """
+    if entries is None:
+        entries = sorted(os.listdir(frames_dir))
+    foreign = [name for name in entries if not is_sequence_file(name)]
+    if foreign:
+        raise SystemExit(
+            f"Error: --frames-dir '{frames_dir}' contains files that are not part "
+            f"of a saved frame sequence (for example '{foreign[0]}'). Use an "
+            "empty, dedicated output folder."
+        )
+    preserved = {name for name in entries if _is_preserved_output(name, frames_dir)}
+    for name in entries:
+        if name in preserved:
+            continue
+        try:
+            os.remove(os.path.join(frames_dir, name))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise SystemExit(
+                f"Error: could not clear the frame sequence in '{frames_dir}': {exc}"
+            ) from exc
+
+
 # Iteration frames written by single-image --frames/--timelapse runs.
 _STALE_FRAME_RE = re.compile(r"^o\d+_i\d+\.png$", re.IGNORECASE)
+# Sequential per-frame filenames written by zoom/video generation when a
+# frames dir is given. Kept distinct from the single-image `o{oct}_i{iter}`
+# timelapse pattern so the two encoders can tell their inputs apart.
+VIDEO_FRAME_PATTERN = re.compile(r"^frame_(\d+)\.png$", re.IGNORECASE)
+# Atomic-save temps from an interrupted frame or metadata write.
+_SEQUENCE_TEMP_RE = re.compile(r"^\.frame_\d+\.tmp\.png$", re.IGNORECASE)
+_SEQUENCE_TEMP_NAMES = (VIDEO_FRAMES_META + ".tmp",)
+# Atomic-save temps from an iteration-frame write (save_image -> publish_media)
+# and their `.complete` sidecars. A temp with its sidecar is a finished output
+# a locked destination kept from being published, so it must survive cleanup.
+_ITERATION_TEMP_RE = re.compile(r"^o\d+_i\d+\.png\.p\d+\.tmp(?:\.complete)?$", re.IGNORECASE)
+_COMPLETE_SUFFIX = ".complete"
+
+
+def is_sequence_file(name: str) -> bool:
+    """True for the files this app writes into a --frames-dir."""
+    return (
+        VIDEO_FRAME_PATTERN.match(name) is not None
+        or _STALE_FRAME_RE.match(name) is not None
+        or _ITERATION_TEMP_RE.match(name) is not None
+        or name == VIDEO_FRAMES_META
+    )
+
+
+def _is_preserved_output(name: str, frames_dir: str | os.PathLike) -> bool:
+    """True for a finished temp awaiting manual recovery, or its live sidecar.
+
+    publish_media writes ``<temp>.complete`` before replacing and leaves both
+    behind when the destination stays locked, so the completed output can be
+    recovered. Engine sweeps and --clear-frames skip the pair the way GUI
+    cleanup does; a sidecar whose temp is already gone is stale, not a
+    recovery candidate.
+    """
+    if name.lower().endswith(_COMPLETE_SUFFIX):
+        base = name[: -len(_COMPLETE_SUFFIX)]
+        return _ITERATION_TEMP_RE.match(base) is not None and os.path.exists(
+            os.path.join(frames_dir, base)
+        )
+    return _ITERATION_TEMP_RE.match(name) is not None and os.path.exists(
+        os.path.join(frames_dir, name + _COMPLETE_SUFFIX)
+    )
+
+
+def _is_sweepable_temp(name: str) -> bool:
+    """True for names the temp sweep considers (a preserved pair is still skipped)."""
+    return (
+        name in _SEQUENCE_TEMP_NAMES
+        or _SEQUENCE_TEMP_RE.match(name) is not None
+        or _ITERATION_TEMP_RE.match(name) is not None
+    )
+
+
+def remove_sequence_temps(frames_dir: str | os.PathLike | None) -> None:
+    """Drop atomic-save temps an interrupted write may have left behind.
+
+    Unmarked temps are partial writes. A temp kept for recovery, with its
+    ``.complete`` sidecar, is a finished output instead: it and the sidecar
+    are left for manual recovery, and stale sidecars whose temp is gone go.
+    """
+    if not frames_dir or not os.path.isdir(frames_dir):
+        return
+    try:
+        entries = os.listdir(frames_dir)
+    except OSError:
+        return
+    for name in entries:
+        if not _is_sweepable_temp(name):
+            continue
+        if _is_preserved_output(name, frames_dir):
+            if not name.lower().endswith(_COMPLETE_SUFFIX):
+                print(
+                    f"Note: preserved output from an earlier run kept at "
+                    f"'{os.path.join(frames_dir, name)}'; delete it once recovered.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            continue
+        try:
+            os.remove(os.path.join(frames_dir, name))
+        except OSError:
+            pass
 
 
 def clear_stale_frames(frames_dir: str | os.PathLike | None, allow_delete: bool = False) -> None:
     """Clear old iteration frames only when explicitly requested."""
     if not frames_dir or not os.path.isdir(frames_dir):
         return
+    remove_sequence_temps(frames_dir)
     try:
         entries = os.listdir(frames_dir)
     except OSError as exc:
         raise SystemExit(f"Error: cannot inspect --frames-dir '{frames_dir}': {exc}") from exc
-    foreign = [name for name in entries if not _STALE_FRAME_RE.match(name)]
+    foreign = [
+        name
+        for name in entries
+        if not _STALE_FRAME_RE.match(name) and not _is_preserved_output(name, frames_dir)
+    ]
     if foreign:
         raise SystemExit(
             f"Error: --frames-dir '{frames_dir}' contains files not recognized as "
@@ -643,11 +830,17 @@ def deepdream(
 
 
 def resolve_video_quality(video_quality="balanced", crf=None, preset=None):
-    """Resolve H.264 CRF and encoding speed preset from quality name or explicit values."""
+    """Resolve H.264 CRF, speed preset, and encode scale from a quality name.
+
+    Returns (crf, preset, scale). scale comes from the named preset only:
+    the lossless preset encodes at 2x resolution; a custom --crf override
+    never changes geometry.
+    """
     vq_key = (video_quality or "balanced").lower().strip()
     if vq_key in VIDEO_QUALITY_PRESETS:
         target_crf = VIDEO_QUALITY_PRESETS[vq_key]["crf"]
         target_preset = VIDEO_QUALITY_PRESETS[vq_key]["preset"]
+        target_scale = VIDEO_QUALITY_PRESETS[vq_key]["scale"]
     else:
         raise ValueError(
             f"Unknown video quality preset '{video_quality}'. "
@@ -672,7 +865,7 @@ def resolve_video_quality(video_quality="balanced", crf=None, preset=None):
     if not (0 <= target_crf <= 51):
         raise ValueError(f"CRF must be between 0 and 51, got {target_crf}")
 
-    return target_crf, target_preset
+    return target_crf, target_preset, target_scale
 
 
 @dataclass
@@ -693,6 +886,8 @@ class VideoExportConfig:
     guide: str | None = None
     resume: bool = False
     seed: int | None = None
+    scale: int = 1
+    clear_frames: bool = False
 
 
 def dream_zoom_animation(
@@ -725,12 +920,15 @@ def dream_zoom_animation(
     resume=False,
     config: VideoExportConfig | None = None,
     seed: int | None = None,
+    scale=1,
+    clear_frames=False,
 ):
     if config is not None:
         fps = config.fps
         preview_file = config.preview_file if preview_file is None else preview_file
         crf = config.crf
         preset = config.preset
+        scale = config.scale
         zoom_cx = config.zoom_cx
         zoom_cy = config.zoom_cy
         frames_dir = config.frames_dir if frames_dir is None else frames_dir
@@ -740,6 +938,7 @@ def dream_zoom_animation(
         class_name = config.class_name if class_name is None else class_name
         guide = config.guide if guide is None else guide
         resume = resume if resume else getattr(config, "resume", False)
+        clear_frames = clear_frames or getattr(config, "clear_frames", False)
         seed = config.seed if seed is None else seed
 
     if seed is not None:
@@ -766,6 +965,20 @@ def dream_zoom_animation(
     if (even_w, even_h) != (iw, ih):
         img = resize(img, (even_h, even_w))
     validate_input_size(img.shape[2], img.shape[3], model_key)
+
+    prepare_video_frames_dir(frames_dir, resume, clear_frames)
+    if (
+        resume
+        and frames_dir
+        and any(
+            (match := VIDEO_FRAME_PATTERN.match(name)) and int(match.group(1)) > num_frames
+            for name in os.listdir(frames_dir)
+        )
+    ):
+        raise SystemExit(
+            "Error: the saved sequence has frames beyond --zoom-frames. "
+            "Use the original frame count or a new, empty --frames-dir."
+        )
 
     start_frame = 0
     if resume and frames_dir and os.path.isdir(frames_dir):
@@ -841,9 +1054,15 @@ def dream_zoom_animation(
 
     crf_str = f", crf={crf}" if (encode and crf is not None) else ""
     frames_str = f", frames -> {frames_dir}" if frames_dir else ""
+    enc_w, enc_h = (even_w * scale, even_h * scale) if encode and scale > 1 else (even_w, even_h)
+    geom = (
+        f"{even_w}x{even_h}"
+        if (enc_w, enc_h) == (even_w, even_h)
+        else f"{even_w}x{even_h} -> {enc_w}x{enc_h}"
+    )
     print(
         f"Generating zoom animation: {num_frames} frames @ {fps} fps "
-        f"({even_w}x{even_h}, zoom_scale={zoom_scale}, rot={zoom_rot}\u00b0"
+        f"({geom}, zoom_scale={zoom_scale}, rot={zoom_rot}°"
         f", focus=({zoom_cx:.3f}, {zoom_cy:.3f}){crf_str}{frames_str})...",
         flush=True,
     )
@@ -861,7 +1080,7 @@ def dream_zoom_animation(
         if encode and temp_out:
             writer = _open_video_writer(temp_out, fps, output_params)
             if start_frame > 0 and frames_dir:
-                _append_saved_video_frames(writer, frames_dir, start_frame)
+                _append_saved_video_frames(writer, frames_dir, start_frame, scale)
         try:
             loss = 0.0
             for f in range(start_frame, num_frames):
@@ -878,7 +1097,7 @@ def dream_zoom_animation(
                     )
                 frame_np = tensor_to_np(img)
                 if writer is not None:
-                    writer.append_data(frame_np)
+                    writer.append_data(_upscale_frame(frame_np, scale))
                 if frames_dir:
                     _save_frame_atomic(frame_np, frames_dir, f + 1)
                 if (
@@ -905,7 +1124,7 @@ def dream_zoom_animation(
         if not encode or not temp_out:
             return frames_dir
         try:
-            _publish_video(temp_out, out_path)
+            _publish_media(temp_out, out_path)
         except PermissionError:
             keep_temp = True
             raise
@@ -943,16 +1162,20 @@ def dream_video_file(
     resume=False,
     config: VideoExportConfig | None = None,
     seed: int | None = None,
+    scale=1,
+    clear_frames=False,
 ):
     if config is not None:
         preview_file = config.preview_file if preview_file is None else preview_file
         crf = config.crf
         preset = config.preset
+        scale = config.scale
         frames_dir = config.frames_dir if frames_dir is None else frames_dir
         custom_name = config.custom_name if custom_name is None else custom_name
         class_name = config.class_name if class_name is None else class_name
         guide = config.guide if guide is None else guide
         resume = resume if resume else getattr(config, "resume", False)
+        clear_frames = clear_frames or getattr(config, "clear_frames", False)
         seed = config.seed if seed is None else seed
 
     if seed is not None:
@@ -973,8 +1196,14 @@ def dream_video_file(
 
     if encode:
         ensure_output_dir(os.path.dirname(video_out_path) or ".")
-    if frames_dir:
-        ensure_output_dir(frames_dir)
+    # Decode and validate the first frame before any destructive frame-folder
+    # preparation. A missing/corrupt/too-small video fails before --clear-frames
+    # removes a sequence, but only the first frame is checked: a video that
+    # fails later in the run can still leave the old sequence cleared.
+    first_frame_size = _first_video_frame_size(video_in_path)
+    first_canvas = _video_canvas_size(first_frame_size, max_size)
+    validate_input_size(first_canvas[1], first_canvas[0], model_key, what="Video frame")
+    prepare_video_frames_dir(frames_dir, resume, clear_frames)
 
     fps = 30.0
     n_frames = None
@@ -1026,7 +1255,7 @@ def dream_video_file(
 
     prev_dreamed = None
     if start_frame > 0:
-        canvas_w, canvas_h = _video_canvas_size(_first_video_frame_size(video_in_path), max_size)
+        canvas_w, canvas_h = _video_canvas_size(first_frame_size, max_size)
         _check_resume_compatible(
             frames_dir,
             start_frame,
@@ -1085,7 +1314,7 @@ def dream_video_file(
         if encode and temp_out:
             writer = _open_video_writer(temp_out, fps, output_params)
             if start_frame > 0 and frames_dir:
-                _append_saved_video_frames(writer, frames_dir, start_frame)
+                _append_saved_video_frames(writer, frames_dir, start_frame, scale)
         try:
             loss = 0.0
             target_canvas_size = None
@@ -1145,7 +1374,7 @@ def dream_video_file(
                 prev_dreamed = cur_img.detach()
                 frame_np = tensor_to_np(cur_img)
                 if writer is not None:
-                    writer.append_data(frame_np)
+                    writer.append_data(_upscale_frame(frame_np, scale))
                 if frames_dir:
                     _save_frame_atomic(frame_np, frames_dir, frame_idx)
 
@@ -1212,12 +1441,6 @@ def dream_video_file(
         raise
 
 
-# Sequential per-frame filenames written by zoom/video generation when a
-# frames dir is given. Kept distinct from the single-image `o{oct}_i{iter}`
-# timelapse pattern so the two encoders can tell their inputs apart.
-VIDEO_FRAME_PATTERN = re.compile(r"^frame_(\d+)\.png$", re.IGNORECASE)
-
-
 def list_video_frames(frames_dir):
     """Sorted frame PNGs in *frames_dir*; prefers frame_NNNNNN.png, then sorted
     o*_i* or generic PNGs so timelapse folders can be re-exported. GUI preview
@@ -1246,7 +1469,7 @@ def list_video_frames(frames_dir):
         n
         for n in names
         if n.lower().endswith(".png")
-        and not n.lower().startswith("_gui_preview")
+        and not n.lower().startswith(("_gui_preview", "."))
         and not n.lower().endswith(".tmp")
     ]
     generic.sort(
@@ -1255,13 +1478,19 @@ def list_video_frames(frames_dir):
     return [os.path.join(frames_dir, n) for n in generic]
 
 
-def _encode_png_sequence(files, out_path, fps=30, crf=17, preset="medium", what="video"):
-    """Encode sorted PNG *files* to an H.264 .mp4 at *out_path* (atomic)."""
+def _encode_png_sequence(files, out_path, fps=30, crf=17, preset="medium", what="video", scale=1):
+    """Encode sorted PNG *files* to an H.264 .mp4 at *out_path* (atomic).
+
+    scale multiplies the encode geometry (lossless preset = 2); source PNGs
+    are resized per-frame so only the output MP4 grows.
+    """
     ensure_output_dir(os.path.dirname(out_path) or ".")
     with Image.open(files[-1]) as last_img:
         fw, fh = last_img.size
-    target_w = max(2, fw - (fw % 2))
-    target_h = max(2, fh - (fh % 2))
+    base_w = max(2, fw - (fw % 2))
+    base_h = max(2, fh - (fh % 2))
+    scale = scale if scale and scale > 1 else 1
+    target_w, target_h = base_w * scale, base_h * scale
     crf_str = f", crf={crf}" if crf is not None else ""
     print(
         f"Compiling {len(files)} frames into {what}: {out_path} "
@@ -1278,11 +1507,9 @@ def _encode_png_sequence(files, out_path, fps=30, crf=17, preset="medium", what=
             for idx, path in enumerate(files, 1):
                 with Image.open(path) as frame_img:
                     img = frame_img.convert("RGB")
-                if img.size != (target_w, target_h):
-                    img = img.resize(
-                        (target_w, target_h), getattr(Image, "Resampling", Image).LANCZOS
-                    )
-                writer.append_data(np.asarray(img))
+                if img.size != (base_w, base_h):
+                    img = img.resize((base_w, base_h), getattr(Image, "Resampling", Image).LANCZOS)
+                writer.append_data(_upscale_frame(np.asarray(img), scale))
                 pct = int(idx / total_frames * 100)
                 print(f"Encoding frame {idx}/{total_frames} ({pct}%)", flush=True)
                 emit_event(EV_FRAME, current=idx, total=total_frames)
@@ -1397,25 +1624,18 @@ def _remux_audio(silent_mp4, audio_source, final_out):
             except OSError:
                 pass
         print("Warning: Audio remux failed; output will have no audio track.", flush=True)
-    try:
-        os.replace(target, final_out)
-        if target is remux_out and os.path.exists(silent_mp4):
-            try:
-                os.remove(silent_mp4)
-            except OSError:
-                pass
-    except PermissionError:
-        print(
-            f"Warning: Destination file '{final_out}' is locked by another program. "
-            f"Completed video preserved at '{target}'.",
-            file=sys.stderr,
-            flush=True,
-        )
-        raise
+    _publish_media(target, final_out)
+    if target is remux_out and os.path.exists(silent_mp4):
+        try:
+            os.remove(silent_mp4)
+        except OSError:
+            pass
     return final_out
 
 
-def compile_video_frames(frames_dir, out_path, fps=30, crf=17, preset="medium", audio_from=None):
+def compile_video_frames(
+    frames_dir, out_path, fps=30, crf=17, preset="medium", audio_from=None, scale=1
+):
     """Encode a saved frame sequence (frame_*.png) to .mp4.
     The save half of the generate/save split, so frames export at any quality
     without re-running the dream; audio from *audio_from* or the meta is remuxed."""
@@ -1435,7 +1655,7 @@ def compile_video_frames(frames_dir, out_path, fps=30, crf=17, preset="medium", 
         # A zoom animation's source is a still image, so there is nothing to
         # remux; skip ffmpeg entirely rather than run it for no reason.
         audio_from = None
-    temp_out = _encode_png_sequence(files, out_path, fps=fps, crf=crf, preset=preset)
+    temp_out = _encode_png_sequence(files, out_path, fps=fps, crf=crf, preset=preset, scale=scale)
     keep_temp = False
     try:
         if audio_from and os.path.isfile(audio_from):
@@ -1445,7 +1665,7 @@ def compile_video_frames(frames_dir, out_path, fps=30, crf=17, preset="medium", 
                 keep_temp = True
                 raise
         try:
-            _publish_video(temp_out, out_path)
+            _publish_media(temp_out, out_path)
         except PermissionError:
             keep_temp = True
             raise
@@ -1459,7 +1679,7 @@ def compile_video_frames(frames_dir, out_path, fps=30, crf=17, preset="medium", 
         raise
 
 
-def compile_timelapse(frames_dir, out_path, fps=30, crf=17, preset="medium"):
+def compile_timelapse(frames_dir, out_path, fps=30, crf=17, preset="medium", scale=1):
     if not _VIDEO_AVAILABLE:
         raise SystemExit("Error: 'imageio' and 'imageio-ffmpeg' are required for timelapse export.")
     if not os.path.isdir(frames_dir):
@@ -1479,10 +1699,10 @@ def compile_timelapse(frames_dir, out_path, fps=30, crf=17, preset="medium"):
         raise SystemExit(f"Error: No PNG frames found in '{frames_dir}'.")
 
     temp_out = _encode_png_sequence(
-        files, out_path, fps=fps, crf=crf, preset=preset, what="timelapse"
+        files, out_path, fps=fps, crf=crf, preset=preset, scale=scale, what="timelapse"
     )
     try:
-        _publish_video(temp_out, out_path, "timelapse")
+        _publish_media(temp_out, out_path, "timelapse")
     except PermissionError:
         # Destination locked: keep the completed temp so the user can recover it.
         raise
@@ -1497,7 +1717,11 @@ def compile_timelapse(frames_dir, out_path, fps=30, crf=17, preset="medium"):
 
 
 def _run_encode_frames_mode(
-    args: argparse.Namespace, video_crf: int, video_preset: str, fps_explicit: bool = False
+    args: argparse.Namespace,
+    video_crf: int,
+    video_preset: str,
+    fps_explicit: bool = False,
+    video_scale: int = 1,
 ) -> None:
     """Encode-only mode: --encode-frames DIR --out OUT.mp4 (no dreaming).
     Reads fps/audio defaults from the sequence meta.json unless overridden."""
@@ -1537,7 +1761,7 @@ def _run_encode_frames_mode(
         if (audio_from and os.path.isfile(audio_from))
         else f".p{os.getpid()}.temp.mp4"
     )
-    validate_output_path(out, extra_suffix=temp_suffix)
+    validate_output_path(out, extra_suffix=temp_suffix + ".complete")
     if args.zoom_fps is not None and (fps_explicit or not meta.get("fps")):
         fps = args.zoom_fps
     else:
@@ -1557,6 +1781,7 @@ def _run_encode_frames_mode(
         fps=fps,
         crf=video_crf,
         preset=video_preset,
+        scale=video_scale,
         audio_from=audio_from,
     )
     print(f"Done in {time.time() - t0:.1f}s -> {out}", flush=True)
@@ -1630,7 +1855,9 @@ def build_cli_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--clear-frames",
         action="store_true",
-        help="with --frames/--timelapse, replace existing iteration frames in --frames-dir",
+        help="with --frames/--timelapse, replace existing iteration frames in --frames-dir; "
+        "with --zoom/--video, replace a saved frame sequence there. "
+        "Files this app did not write are never removed",
     )
     ap.add_argument(
         "--frames-dir",
@@ -1638,7 +1865,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="directory for frames (default: <out>/frames or "
         "<out>/frames_<name> for multi-image runs; used by the GUI to isolate queued jobs). "
         "With --zoom/--video it persists the dreamed video frames as "
-        "frame_*.png (+ meta.json) for later --encode-frames exports",
+        "frame_*.png (+ meta.json) for later --encode-frames exports, and "
+        "must be empty unless --resume or --clear-frames is given",
     )
     ap.add_argument(
         "--preview-file",
@@ -1754,14 +1982,15 @@ def build_cli_parser() -> argparse.ArgumentParser:
         choices=["small", "balanced", "lossless"],
         default="balanced",
         help="video encoding quality preset: small (CRF 28), "
-        "balanced (CRF 17, default), lossless (CRF 0)",
+        "balanced (CRF 17, default), lossless (CRF 12, 2x resolution / 4x pixels)",
     )
     ap.add_argument(
         "--crf",
         type=int,
         default=None,
         help="H.264 Constant Rate Factor "
-        "(0=lossless to 51=max compression, overrides --video-quality)",
+        "(0=minimum compression to 51=maximum compression; overrides --video-quality CRF only — "
+        "geometry stays at the preset's scale)",
     )
     ap.add_argument(
         "--seed",
@@ -1802,7 +2031,7 @@ def apply_seed(seed: int) -> None:
 
 def _resolve_and_validate_args(
     args: argparse.Namespace,
-) -> tuple[str, list[str], int | None, str | None, int, str] | None:
+) -> tuple[str, list[str], int | None, str | None, int, str, int] | None:
     """Validate arguments and resolve defaults. Returns None if handled directly."""
     if args.seed is not None:
         apply_seed(args.seed)
@@ -1880,8 +2109,24 @@ def _resolve_and_validate_args(
         raise SystemExit("Error: the following arguments are required: image")
     if args.frames_only and not (args.zoom or args.video):
         raise SystemExit("Error: --frames-only requires --zoom or --video.")
-    if args.clear_frames and not (args.frames or args.timelapse):
-        raise SystemExit("Error: --clear-frames requires --frames or --timelapse.")
+    if args.clear_frames and not (args.frames or args.timelapse or args.zoom or args.video):
+        raise SystemExit(
+            "Error: --clear-frames requires --frames, --timelapse, --zoom, or --video."
+        )
+    if args.clear_frames and args.resume:
+        raise SystemExit(
+            "Error: --clear-frames cannot be combined with --resume; "
+            "--clear-frames starts a new sequence, --resume continues the saved one."
+        )
+    if (
+        args.clear_frames
+        and (args.zoom or args.video)
+        and not (args.frames_dir or args.frames_only)
+    ):
+        raise SystemExit(
+            "Error: --clear-frames with --zoom or --video needs a frame folder to clear; "
+            "add --frames-dir or --frames-only."
+        )
     if args.encode_audio_from and not args.encode_frames:
         raise SystemExit("Error: --encode-audio-from requires --encode-frames.")
     fps_explicit = args.zoom_fps is not None
@@ -1930,14 +2175,20 @@ def _resolve_and_validate_args(
         raise SystemExit(f"Error: --crf must be between 0 and 51, got {args.crf}")
 
     try:
-        video_crf, video_preset = resolve_video_quality(
+        video_crf, video_preset, video_scale = resolve_video_quality(
             video_quality=args.video_quality, crf=args.crf
         )
     except ValueError as exc:
         raise SystemExit(f"Error: {exc}") from None
 
     if args.encode_frames:
-        _run_encode_frames_mode(args, video_crf, video_preset, fps_explicit)
+        _run_encode_frames_mode(
+            args,
+            video_crf,
+            video_preset,
+            fps_explicit=fps_explicit,
+            video_scale=video_scale,
+        )
         return None
 
     if args.timelapse:
@@ -1953,7 +2204,7 @@ def _resolve_and_validate_args(
         print("Note: --frames-dir given without --frames/--timelapse, so it will be ignored.")
 
     ensure_output_dir(args.out)
-    return model_key, targets, class_id, class_name, video_crf, video_preset
+    return model_key, targets, class_id, class_name, video_crf, video_preset, video_scale
 
 
 def _build_image_plan(
@@ -2053,10 +2304,10 @@ def _build_image_plan(
             if args.video
             else (f".p{os.getpid()}.temp.mp4" if args.zoom else f".p{os.getpid()}.tmp")
         )
-        validate_output_path(out_path, extra_suffix=temp_suffix)
+        validate_output_path(out_path, extra_suffix=temp_suffix + ".complete")
         if args.timelapse:
             tl_path = os.path.join(args.out, f"{name}{suffix}_timelapse.mp4")
-            validate_output_path(tl_path, extra_suffix=f".p{os.getpid()}.temp.mp4")
+            validate_output_path(tl_path, extra_suffix=f".p{os.getpid()}.temp.mp4.complete")
 
         if args.frames:
             if args.frames_dir:
@@ -2082,13 +2333,13 @@ def _build_image_plan(
                 frames_dir = os.path.join(args.out, f"frames_{name}")
         else:
             frames_dir = None
+        if frames_dir and (args.zoom or args.video):
+            check_video_frames_dir_free(frames_dir, bool(args.resume), bool(args.clear_frames))
         if frames_dir and args.iterations > 0:
             if args.zoom or args.video:
                 max_frame = args.zoom_frames if args.zoom else 999999
-                validate_output_path(
-                    os.path.join(frames_dir, f"frame_{max_frame:06d}.png"),
-                    extra_suffix=f".p{os.getpid()}.tmp",
-                )
+                # save_frame_atomic writes ".frame_NNNNNN.tmp.png" via os.replace.
+                validate_output_path(os.path.join(frames_dir, f".frame_{max_frame:06d}.tmp.png"))
             else:
                 model_spec = MODEL_REGISTRY.get(model_key)
                 model_min = model_spec["min_size"] if model_spec is not None else MIN_OCTAVE_SIZE
@@ -2100,9 +2351,11 @@ def _build_image_plan(
                     min_octave_size=max(MIN_OCTAVE_SIZE, model_min),
                     target_base_size=max(TARGET_BASE_SIZE, model_min),
                 )
+                # save_image -> publish_media writes the frame temp and then its
+                # ".complete" sidecar; the longest path is the sidecar.
                 validate_output_path(
                     os.path.join(frames_dir, f"o{n_octaves}_i{args.iterations}.png"),
-                    extra_suffix=f".p{os.getpid()}.tmp",
+                    extra_suffix=f".p{os.getpid()}.tmp.complete",
                 )
 
         image_plan.append(
@@ -2286,6 +2539,7 @@ def _execute_image_plan(
     image_plan: list[dict[str, Any]],
     plan_errors: int,
     t_all_start: float,
+    video_scale: int,
 ) -> None:
     """Execute dreaming over the planned batch sequence."""
     total_images = len(args.image)
@@ -2329,6 +2583,7 @@ def _execute_image_plan(
                 preview_file=args.preview_file,
                 crf=video_crf,
                 preset=video_preset,
+                scale=video_scale,
                 zoom_cx=args.zoom_cx,
                 zoom_cy=args.zoom_cy,
                 frames_dir=frames_dir,
@@ -2338,6 +2593,7 @@ def _execute_image_plan(
                 class_name=class_name,
                 guide=args.guide,
                 resume=bool(args.resume),
+                clear_frames=bool(args.clear_frames),
                 seed=image_seed,
             )
 
@@ -2429,6 +2685,7 @@ def _execute_image_plan(
                             fps=args.timelapse_fps,
                             crf=video_crf,
                             preset=video_preset,
+                            scale=video_scale,
                         )
                         print(f"Timelapse video -> {tl_path}", flush=True)
                     except (OSError, RuntimeError, ValueError) as exc:
@@ -2519,7 +2776,7 @@ def main(argv: list[str] | None = None) -> None:
     resolved = _resolve_and_validate_args(args)
     if resolved is None:
         return
-    model_key, targets, class_id, class_name, video_crf, video_preset = resolved
+    model_key, targets, class_id, class_name, video_crf, video_preset, video_scale = resolved
 
     t_plan_start = time.time()
     image_plan, plan_errors = _build_image_plan(args, model_key, targets, class_id, class_name)
@@ -2545,6 +2802,7 @@ def main(argv: list[str] | None = None) -> None:
         class_name=class_name,
         video_crf=video_crf,
         video_preset=video_preset,
+        video_scale=video_scale,
         device=device,
         model=model,
         guide_features=guide_features,
