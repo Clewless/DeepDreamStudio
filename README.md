@@ -35,7 +35,7 @@ or clone this repository, then run the launcher inside the extracted folder.
 
 Select an image from your disk by either dragging and dropping it in the window or browsing your files using your default file browser. Press the "Dream" button, and that's it!
 
-You can inspect your images using the built-in photo viewer, and find them on your disk in the "out" folder of this program's root. Generated images are saved automatically. For zoom or video runs, click **Save Video** in the GUI to export the generated frames as an MP4; source audio is copied when available for video-mode runs.
+You can inspect your images using the built-in photo viewer, and find them on your disk in the "out" folder of this program's root. Generated images are saved automatically. For zoom or video runs, click **Save Video** in the GUI to export the generated frames as an MP4; source audio is carried over and re-encoded to AAC when available for video-mode runs.
 
 ## Troubleshooting
 
@@ -101,9 +101,7 @@ see [Contributing](CONTRIBUTING.md#dependencies) for reproducible setup and upda
 
 ## Install
 
-Requires Python 3.11, 3.12, 3.13, or 3.14*.
-
-*Python 3.14 is currently not supported on macOS.
+Requires Python 3.11–3.14 on Windows/Linux. On macOS, use Python 3.11–3.13: 3.14 is not validated there and the launcher rejects it.
 
 On Linux, install Tkinter if needed — without it the GUI launcher stops with an error telling you the exact command:
 

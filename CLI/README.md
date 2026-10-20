@@ -57,7 +57,7 @@ Model weights download from PyTorch on first use.
 | `--zoom-rot` | `0.0` | Rotation per zoom frame, in degrees. |
 | `--fps` / `--zoom-fps` | `30` | Video frame rate. |
 | `--zoom-x` / `--zoom-y` | `0.5` / `0.5` | Normalized zoom focus coordinates (0–1). |
-| `--video` | Off | Process an input video, preserving its audio when possible. |
+| `--video` | Off | Process an input video, carrying its audio over as AAC when possible. |
 | `--video-blend` | `0.5` | Previous-dream weight for video blending; higher values retain more of the previous frame. |
 | `--frames` | Off | Save iteration frames as PNGs. Existing matching frames require `--clear-frames`. |
 | `--clear-frames` | Off | With `--frames` or `--timelapse`, explicitly remove existing iteration frames in `--frames-dir` before writing replacements; with `--zoom` or `--video`, replace a saved frame sequence in the frame folder, which requires `--frames-dir` or `--frames-only`; only the first video frame is validated before the old sequence is removed. Other files in the directory make the run fail safely. Cannot be combined with `--resume`. |

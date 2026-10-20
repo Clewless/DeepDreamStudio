@@ -13,6 +13,8 @@ maintainers = [{ name = "Clewless", email = "20273340+Clewless@users.noreply.git
 keywords = ["deepdream", "deep-dream", "pytorch", "cuda", "generative-art", "inception", "vgg"]
 license = "BSD-3-Clause"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+# Metadata cannot express the macOS exception; app/bootstrap.py enforces
+# 3.11-3.13 there because 3.14 wheels are not validated on macOS.
 requires-python = ">=3.11,<3.15"
 classifiers = [
   "Development Status :: 4 - Beta",

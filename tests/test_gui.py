@@ -3473,6 +3473,9 @@ class TestIntegratedViewerGUI(unittest.TestCase):
         from app.gui_job import GenerationJob
         from app.model_data import write_video_frames_meta
 
+        run_enter_binding = self.app._run_btn.bind("<Enter>")
+        resume_enter_binding = self.app._main_resume_btn.bind("<Enter>")
+
         with tempfile.TemporaryDirectory() as td:
             frames_dir = os.path.join(td, "seq_stopped")
             os.makedirs(frames_dir, exist_ok=True)
@@ -3576,6 +3579,11 @@ class TestIntegratedViewerGUI(unittest.TestCase):
                     self.assertIsNone(self.app._resumable_job)
                     self.assertEqual(self.app._main_resume_btn.grid_info(), {})
                     mock_create.assert_called_once()
+
+            # Repeated show/hide updates must retarget the existing tooltips
+            # instead of stacking another set of hover bindings.
+            self.assertEqual(self.app._run_btn.bind("<Enter>"), run_enter_binding)
+            self.assertEqual(self.app._main_resume_btn.bind("<Enter>"), resume_enter_binding)
 
 
 class TestFontResolution(unittest.TestCase):

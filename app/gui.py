@@ -330,6 +330,8 @@ class DeepDreamGUI(
         self._status_label: Any = None
         self._preset_menu: Any = None
         self._main_resume_btn: Any = None
+        self._main_resume_tooltip: Tooltip | None = None
+        self._run_btn_tooltip: Tooltip | None = None
         self._zoom_bar: Any = None
         self._zoom_label: Any = None
         self._compare_seg: Any = None
@@ -1432,7 +1434,9 @@ class DeepDreamGUI(
             command=self._run,
         )
         self._run_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        Tooltip(self._run_btn, "Start dreaming immediately with current settings.")
+        self._run_btn_tooltip = Tooltip(
+            self._run_btn, "Start dreaming immediately with current settings."
+        )
 
         self._main_resume_btn = ModernButton(
             btn_frame,
@@ -1447,7 +1451,9 @@ class DeepDreamGUI(
         )
         self._main_resume_btn.grid(row=0, column=1, sticky="ew", padx=(0, 6))
         self._main_resume_btn.grid_remove()
-        Tooltip(self._main_resume_btn, "Resume generation from the last saved frame.")
+        self._main_resume_tooltip = Tooltip(
+            self._main_resume_btn, "Resume generation from the last saved frame."
+        )
 
         self._save_video_btn = ModernButton(
             btn_frame,
@@ -3081,24 +3087,21 @@ class DeepDreamGUI(
                 tot_txt = f"/{tot}" if tot else ""
                 btn.grid()
                 btn.configure(state="normal", text="\u25b6 Resume")
-                Tooltip(
-                    btn,
+                resume_text = (
                     f"Resume generation from frame {cnt + 1}{tot_txt}.\n"
-                    "Or click '▶ Dream' to start fresh from frame 1.",
+                    "Or click '▶ Dream' to start fresh from frame 1."
                 )
-                try:
-                    Tooltip(
-                        self._run_btn,
-                        "Start fresh from frame 1 (or click '▶ Resume' to continue where you left off).",
+                if self._main_resume_tooltip is not None:
+                    self._main_resume_tooltip.text = resume_text
+                if self._run_btn_tooltip is not None:
+                    self._run_btn_tooltip.text = (
+                        "Start fresh from frame 1 (or click '▶ Resume' to continue "
+                        "where you left off)."
                     )
-                except (tk.TclError, AttributeError):
-                    pass
                 return
         btn.grid_remove()
-        try:
-            Tooltip(self._run_btn, "Start dreaming immediately with current settings.")
-        except (tk.TclError, AttributeError):
-            pass
+        if self._run_btn_tooltip is not None:
+            self._run_btn_tooltip.text = "Start dreaming immediately with current settings."
 
     def _reset_run_button_if_resuming(self):
         if self._resumable_job is not None:
