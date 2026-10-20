@@ -1,7 +1,7 @@
 """Numerical regression checks using a deterministic, download-free model."""
 
 import random
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from pathlib import Path
 from typing import cast
 
@@ -36,6 +36,112 @@ class NumericalModel(nn.Module):
 
 def numerical_input() -> torch.Tensor:
     return torch.linspace(-0.7, 0.9, 3 * 48 * 64, dtype=torch.float64).reshape(1, 3, 48, 64)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_chunked_guide_loss_and_gradients_match_dense(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype
+) -> None:
+    monkeypatch.setattr(dream_engine, "GUIDE_MATCH_BLOCK_SIZE", 4)
+    generator = torch.Generator().manual_seed(318)
+    acts = {
+        "first": torch.randn(1, 3, 3, 5, generator=generator, dtype=dtype, requires_grad=True),
+        "second": torch.randn(1, 2, 2, 3, generator=generator, dtype=dtype, requires_grad=True),
+    }
+    guides = {
+        name: torch.randn(a.shape[1], 11, generator=generator, dtype=dtype, requires_grad=True)
+        for name, a in acts.items()
+    }
+    expected = torch.zeros((), dtype=dtype)
+    for name, a in acts.items():
+        features = a[0].flatten(1)
+        normalized = features / (features.norm(dim=0, keepdim=True) + 1e-7)
+        expected = expected + (normalized.t() @ guides[name]).max(dim=1).values.sum()
+    inputs = [*acts.values(), *guides.values()]
+    expected_grads = torch.autograd.grad(expected, inputs)
+    actual = dream_engine.activation_loss(acts, guides)
+    actual_grads = torch.autograd.grad(actual, inputs)
+    torch.testing.assert_close(actual, expected)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
+def test_chunked_guide_matching_keeps_first_tie(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dream_engine, "GUIDE_MATCH_BLOCK_SIZE", 2)
+    features = torch.tensor([[1.0], [0.0]], requires_grad=True)
+    # Equal scores but distinct gradients, including a tie across block boundaries.
+    guide = torch.tensor([[1.0, 0.0, 1.0], [2.0, 0.0, 9.0]], requires_grad=True)
+    expected = (features.t() @ guide).max(dim=1).values.sum()
+    expected_grads = torch.autograd.grad(expected, (features, guide))
+    actual = dream_engine._guide_match_loss(features, guide)
+    actual_grads = torch.autograd.grad(actual, (features, guide))
+    torch.testing.assert_close(actual, expected)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
+def test_chunked_guide_matching_rejects_nonfinite_guide_features() -> None:
+    features = torch.tensor([[1.0], [0.0]], requires_grad=True)
+    # NaN never wins the strict `>` winner comparison. Without the finiteness
+    # check, this query would silently fall back to guide column 0.
+    guide = torch.tensor([[1.0, float("nan")], [0.0, 0.0]])
+    with pytest.raises(ValueError, match="Guide features must contain only finite values"):
+        dream_engine._guide_match_loss(features, guide)
+
+
+def test_guide_matching_bounds_matrices_without_autograd(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dream_engine, "GUIDE_MATCH_BLOCK_SIZE", 4)
+    original_mm = torch.mm
+    shapes = []
+
+    def checked_mm(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        assert not torch.is_grad_enabled()
+        result = original_mm(left, right)
+        shapes.append(tuple(result.shape))
+        assert result.shape[0] <= 4 and result.shape[1] <= 4
+        return result
+
+    monkeypatch.setattr(torch, "mm", checked_mm)
+    features = torch.randn(3, 9, requires_grad=True)
+    guide = torch.randn(3, 11)
+    dream_engine._guide_match_loss(features, guide).backward()
+    assert len(shapes) == 9
+    assert shapes[-1] == (1, 3)
+    assert features.grad is not None
+
+
+@pytest.mark.parametrize("adapter", [False, True], ids=["core", "cli-adapter"])
+def test_guided_deepdream_validates_features_once_per_run(
+    monkeypatch: pytest.MonkeyPatch, adapter: bool
+) -> None:
+    original_validate = dream_engine._validate_guide_features
+    validation_calls = 0
+
+    def counted_validate(
+        guide_features: dream_engine.GuideFeatures | None, layers: Collection[str]
+    ) -> None:
+        nonlocal validation_calls
+        validation_calls += 1
+        original_validate(guide_features, layers)
+
+    monkeypatch.setattr(dream_engine, "_validate_guide_features", counted_validate)
+    run = cli.deepdream if adapter else dream_engine.deepdream
+    run(
+        NumericalModel(),
+        "vgg16",
+        numerical_input(),
+        ["features.0"],
+        2,
+        0.025,
+        1.4,
+        1,
+        0,
+        "cpu",
+        guide_features={
+            "features.0": torch.linspace(-0.5, 0.8, 14, dtype=torch.float64).reshape(2, 7)
+        },
+    )
+    assert validation_calls == 1
 
 
 @pytest.fixture(autouse=True)
@@ -331,6 +437,31 @@ def test_invalid_run_cannot_clear_existing_frames(tmp_path: Path) -> None:
             0,
             "cpu",
             frames_dir=frames,
+            clear_frames=True,
+        )
+    assert existing.read_bytes() == b"previous result"
+
+
+def test_nonfinite_guide_cannot_clear_existing_frames(tmp_path: Path) -> None:
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    existing = frames / "o1_i1.png"
+    existing.write_bytes(b"previous result")
+    guide = {"features.0": torch.full((2, 7), float("nan"), dtype=torch.float64)}
+    with pytest.raises(ValueError, match="Guide features must contain only finite values"):
+        cli.deepdream(
+            NumericalModel(),
+            "vgg16",
+            numerical_input(),
+            ["features.0"],
+            2,
+            0.025,
+            1.4,
+            1,
+            0,
+            "cpu",
+            frames_dir=frames,
+            guide_features=guide,
             clear_frames=True,
         )
     assert existing.read_bytes() == b"previous result"

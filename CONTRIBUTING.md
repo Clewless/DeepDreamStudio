@@ -155,11 +155,12 @@ limitations in the GitHub release notes.
 
 ### Release validation
 
-CI covers the test suite, coverage reports, distribution builds, launcher-bundle
-verification, and the installed-wheel smoke check on every supported
-platform/Python combination, always on CPU. Before a release, complete this
-manual pass on at least one machine running the graphical app, and record the
-result (OS, Python, GPU/driver, dependency set) in the release notes.
+CI runs the test suite and coverage reports on every supported platform/Python
+combination, always on CPU. Distribution builds, launcher-bundle verification,
+and the installed-wheel smoke check run on Ubuntu with Python 3.12. Before a
+release, complete this manual pass on at least one machine running the graphical
+app, and record the result (OS, Python, GPU/driver, dependency set) in the
+release notes.
 
 - [ ] Launch the extracted release ZIP from a fresh folder; first-launch setup
   completes and the window appears.

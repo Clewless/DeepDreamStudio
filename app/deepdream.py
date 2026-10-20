@@ -965,6 +965,8 @@ def dream_zoom_animation(
     if (even_w, even_h) != (iw, ih):
         img = resize(img, (even_h, even_w))
     validate_input_size(img.shape[2], img.shape[3], model_key)
+    if iterations_per_frame > 0:
+        dream_engine._validate_guide_features(guide_features, targets)
 
     prepare_video_frames_dir(frames_dir, resume, clear_frames)
     if (
@@ -1203,6 +1205,8 @@ def dream_video_file(
     first_frame_size = _first_video_frame_size(video_in_path)
     first_canvas = _video_canvas_size(first_frame_size, max_size)
     validate_input_size(first_canvas[1], first_canvas[0], model_key, what="Video frame")
+    if iterations_per_frame > 0:
+        dream_engine._validate_guide_features(guide_features, targets)
     prepare_video_frames_dir(frames_dir, resume, clear_frames)
 
     fps = 30.0
