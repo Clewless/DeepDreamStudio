@@ -551,8 +551,13 @@ class TestDeepDreamGUIInit(unittest.TestCase):
                 "single_image_iters": 40,
             }
         )
-        with mock.patch.object(gui, "load_settings", return_value=payload):
-            app = gui.DeepDreamGUI()
+        try:
+            with mock.patch.object(gui, "load_settings", return_value=payload):
+                app = gui.DeepDreamGUI()
+        except Exception as exc:
+            if "no display name" in str(exc).lower() or "tcl" in str(exc).lower():
+                self.skipTest("Tk display not available")
+            raise
         try:
             self.assertEqual(app._mode_var.get(), "Dream Video")
             self.assertIn("row", app._video_frame.grid_info())
@@ -565,8 +570,13 @@ class TestDeepDreamGUIInit(unittest.TestCase):
     def test_restores_timelapse_video_quality_visibility(self):
         payload = dict(gui.load_settings())
         payload.update({"mode": "Single Image", "timelapse": True})
-        with mock.patch.object(gui, "load_settings", return_value=payload):
-            app = gui.DeepDreamGUI()
+        try:
+            with mock.patch.object(gui, "load_settings", return_value=payload):
+                app = gui.DeepDreamGUI()
+        except Exception as exc:
+            if "no display name" in str(exc).lower() or "tcl" in str(exc).lower():
+                self.skipTest("Tk display not available")
+            raise
         try:
             self.assertTrue(app._timelapse.get())
             self.assertIn("row", app._video_quality_frame.grid_info())
