@@ -51,6 +51,7 @@ REQUIRED_FILES = {
     "app/model_data.py",
     "app/models.py",
     "app/protocol.py",
+    "app/settings.py",
     "tests/conftest.py",
     "docs/images/example-before-after.jpg",
     "docs/images/gui-result.png",

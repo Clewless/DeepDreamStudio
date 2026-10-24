@@ -33,6 +33,7 @@ def test_bundle_rejects_missing_launcher_before_running_setup(tmp_path: Path) ->
         "app/model_data.py",
         "app/media_io.py",
         "app/models.py",
+        "app/settings.py",
     ],
 )
 def test_bundle_rejects_missing_application_module(tmp_path: Path, omitted: str) -> None:
