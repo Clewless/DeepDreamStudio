@@ -58,6 +58,7 @@ from .gui_helpers import (
     parse_dropped_paths,
     render_zoomed_preview,
     resolve_out_dir,
+    sweep_orphaned_temp_files,
     terminate_process,
 )
 from .gui_job import (
@@ -465,6 +466,30 @@ class DeepDreamGUI(
         if initial_image and os.path.exists(initial_image):
             self.after_idle(lambda: self._load_image_preview(initial_image))
 
+    def _sweep_startup_temps(self):
+        """Reclaim pid-qualified temps no earlier run could clean up.
+
+        The close-time sweep only runs while a child is still alive, and the join
+        that drives it is bounded, so a crash - or a child that outlives that
+        budget - leaves ``<name>.p<pid>.temp.mp4`` and partial frame writes
+        behind. Every later sweep is scoped to one pid or one output path, so
+        nothing revisits them. Only the default output folder is swept. Temps
+        owned by a live process (another instance in the same folder), temps
+        written in the last few minutes, and ``.complete`` recovery pairs are left
+        alone.
+        """
+        try:
+            removed = sweep_orphaned_temp_files(resolve_out_dir(""))
+        except Exception as exc:
+            # Best-effort cleanup: it must never keep the app from starting.
+            self._log_msg(f"Startup temp cleanup failed: {exc}\n", color=TEXT_DIM)
+            return
+        if removed:
+            self._log_msg(
+                f"Removed {removed} orphaned temp file(s) left by a previous run.\n",
+                color=TEXT_DIM,
+            )
+
     def _on_close(self):
         """Cleanly terminate running subprocess when window is closed."""
         self._is_closing = True
@@ -506,7 +531,10 @@ class DeepDreamGUI(
 
             # Reaping: let a daemon thread wait on the children and sweep temps.
             # Perform a bounded join so normal terminations clean up reliably
-            # before Python teardown destroys daemon threads.
+            # before Python teardown destroys daemon threads. The budget covers
+            # the usual fast kill plus the reader joins; a child that outlives it
+            # loses the sweep, and _sweep_startup_temps() reclaims those files on
+            # the next launch if they are in the default output folder.
             proc_ref = self._proc
             encode_proc_ref = encode_proc
             job_ref = job
@@ -549,7 +577,7 @@ class DeepDreamGUI(
 
             t = threading.Thread(target=_reap, daemon=True)
             t.start()
-            t.join(timeout=1.0)
+            t.join(timeout=3.0)
         self._cleanup_preview_temps()
         for row in self._slider_registry:
             row.dispose()
@@ -3291,8 +3319,8 @@ class DeepDreamGUI(
             except tk.TclError:
                 pass
         self._stop_btn.configure(state="normal", text_color=TEXT_MAIN)
-        self._progress.set(0)
-        self._status_label.configure(text=f"Job #{job.id} starting\u2026", text_color=WARNING)
+        self._set_generation_progress(0)
+        self._set_generation_status(f"Job #{job.id} starting\u2026", WARNING)
         self._open_dir_btn.grid_remove()
         try:
             self._view_image_btn.grid_remove()
@@ -3337,8 +3365,8 @@ class DeepDreamGUI(
                 f"\nFailed to start deepdream for Job #{job.id}: {exc}\n", color=ERROR_COL
             )
             job.status = "Failed"
-            self._status_label.configure(text="Error", text_color=ERROR_COL)
-            self._progress.set(0)
+            self._set_generation_status("Error", ERROR_COL)
+            self._set_generation_progress(0)
             self._proc = None
             self._update_queue_badge()
             self._refresh_queue_ui()
@@ -3390,7 +3418,7 @@ class DeepDreamGUI(
                 self._aborted_jobs.add(job.id)
             self._log_msg("\n[Queue stopped by user]\n", color=WARNING)
         else:
-            self._status_label.configure(text="Stopped", text_color=WARNING)
+            self._set_generation_status("Stopped", WARNING)
             self._stop_btn.configure(state="disabled", text_color=TEXT_DIM)
             self._run_btn.configure(state="normal")
             self._refresh_queue_ui()
@@ -3492,15 +3520,15 @@ class DeepDreamGUI(
             self._log_msg(line)
             frac, status = self._tracker.update(line)
             if status:
-                self._status_label.configure(text=status, text_color=WARNING)
+                self._set_generation_status(status, WARNING)
             if frac is not None:
-                self._progress.set(frac)
+                self._set_generation_progress(frac)
             path = extract_output_path(line)
             if path:
                 self._expected_output = path
             if line.strip().startswith("Done in"):
-                self._status_label.configure(text="Done \u2713", text_color=SUCCESS)
-                self._progress.set(1.0)
+                self._set_generation_status("Done \u2713", SUCCESS)
+                self._set_generation_progress(1.0)
 
         if latest_preview:
             self._apply_preview_path(latest_preview)
@@ -3537,14 +3565,14 @@ class DeepDreamGUI(
             path = event.get("path")
             if path:
                 self._expected_output = path
-            self._status_label.configure(text="Done ✓", text_color=SUCCESS)
-            self._progress.set(1.0)
+            self._set_generation_status("Done ✓", SUCCESS)
+            self._set_generation_progress(1.0)
             return False
         frac, status = self._tracker.update_event(event)
         if status:
-            self._status_label.configure(text=status, text_color=WARNING)
+            self._set_generation_status(status, WARNING)
         if frac is not None:
-            self._progress.set(frac)
+            self._set_generation_progress(frac)
         return False
 
     def _apply_preview_path(self, prev_path):
@@ -3592,8 +3620,8 @@ class DeepDreamGUI(
         tot = meta.get("total_frames") or getattr(job, "zoom_frames", None)
         tot_txt = f"/{tot}" if tot else ""
         stop_status = f"Stopped ({cnt}{tot_txt} frames ready)"
-        self._status_label.configure(text=stop_status, text_color=WARNING)
-        self._progress.set(cnt / float(tot) if tot else 0.5)
+        self._set_generation_status(stop_status, WARNING)
+        self._set_generation_progress(cnt / float(tot) if tot else 0.5)
         self._load_video_frames_ready(job, self._frames_dir, status_text=stop_status)
         return True
 
@@ -3614,8 +3642,8 @@ class DeepDreamGUI(
             if job:
                 job.status = "Stopped"
             if not self._recover_partial_video_frames(job):
-                self._status_label.configure(text="Stopped", text_color=WARNING)
-                self._progress.set(0)
+                self._set_generation_status("Stopped", WARNING)
+                self._set_generation_progress(0)
                 self._cleanup_partial_frames()
         elif rc == 0:
             if job:
@@ -3624,15 +3652,15 @@ class DeepDreamGUI(
             if self._resumable_job is job:
                 self._resumable_job = None
                 self._update_resume_button_visibility()
-            self._status_label.configure(text="Done \u2713", text_color=SUCCESS)
-            self._progress.set(1.0)
+            self._set_generation_status("Done \u2713", SUCCESS)
+            self._set_generation_progress(1.0)
             self._load_output_image(job=job)
         else:
             if job:
                 job.status = "Failed"
             if not self._recover_partial_video_frames(job):
-                self._status_label.configure(text="Error", text_color=ERROR_COL)
-                self._progress.set(0)
+                self._set_generation_status("Error", ERROR_COL)
+                self._set_generation_progress(0)
                 self._cleanup_partial_frames()
 
         self._cleanup_preview_temps()
@@ -3935,17 +3963,17 @@ class DeepDreamGUI(
         self._open_dir_btn.grid()
         try:
             if status_text:
-                self._status_label.configure(
-                    text=status_text,
-                    text_color=WARNING if is_stopped else SUCCESS,
+                self._set_generation_status(
+                    status_text,
+                    WARNING if is_stopped else SUCCESS,
                 )
             elif is_stopped:
-                self._status_label.configure(
-                    text=f"Stopped ({count}{tot_txt} frames ready)",
-                    text_color=WARNING,
+                self._set_generation_status(
+                    f"Stopped ({count}{tot_txt} frames ready)",
+                    WARNING,
                 )
             else:
-                self._status_label.configure(text="Frames ready \u2713", text_color=SUCCESS)
+                self._set_generation_status("Frames ready \u2713", SUCCESS)
         except tk.TclError:
             pass
 
@@ -4339,6 +4367,9 @@ def main(argv=None):
     initial_image = argv[0] if argv else None
     try:
         app = DeepDreamGUI(initial_image=initial_image)
+        # Run at launch, not in __init__: constructing the window (tests, smoke
+        # checks, other embeddings) must not sweep the user's output folders.
+        app._sweep_startup_temps()
         app.mainloop()
     except BaseException as exc:
         if isinstance(exc, SystemExit) and exc.code in (0, None):

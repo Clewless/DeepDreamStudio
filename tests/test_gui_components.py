@@ -1,8 +1,12 @@
 """Behavioral checks for widget-free viewer and process components."""
 
+import ctypes
+import os
 import queue
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -157,3 +161,103 @@ def test_installed_outputs_use_home_instead_of_site_packages(tmp_path: Path) -> 
         explicit = tmp_path / "chosen"
         assert gui_helpers.resolve_out_dir(str(explicit)) == str(explicit)
         assert not list(package_root.iterdir())
+
+
+def test_pid_is_running_probes_without_killing() -> None:
+    assert gui_helpers.pid_is_running(os.getpid()) is True
+    assert gui_helpers.pid_is_running(999999999) is False
+    assert gui_helpers.pid_is_running(None) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="probes through kernel32")
+@pytest.mark.parametrize(
+    ("last_error", "running"),
+    [
+        (5, True),  # ERROR_ACCESS_DENIED: a live process owned by another account
+        (87, False),  # ERROR_INVALID_PARAMETER: no process has this pid
+    ],
+)
+def test_pid_is_running_on_windows_reads_why_open_failed(
+    monkeypatch: pytest.MonkeyPatch, last_error: int, running: bool
+) -> None:
+    fake_kernel32 = SimpleNamespace(
+        OpenProcess=lambda access, inherit, pid: None,
+        GetExitCodeProcess=lambda handle, code: 0,
+        CloseHandle=lambda handle: 1,
+    )
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: fake_kernel32)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: last_error)
+    assert gui_helpers.pid_is_running(1234) is running
+
+
+def _backdate(*paths: Path) -> None:
+    """Age files past the grace window, as if their writer had gone quiet."""
+    stamp = time.time() - 3600
+    for path in paths:
+        os.utime(path, (stamp, stamp))
+
+
+def test_startup_sweep_reclaims_only_temps_from_dead_processes(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    dead = 999999999
+    live = os.getpid()
+
+    orphan = out / f"clip.mp4.p{dead}.temp.mp4"
+    orphan.write_bytes(b"partial")
+    writing = out / f"clip.mp4.p{live}.temp.mp4"
+    writing.write_bytes(b"in flight")
+    preserved = out / f"shot.png.p{dead}.tmp"
+    preserved.write_bytes(b"finished")
+    (out / f"shot.png.p{dead}.tmp.complete").write_text("", encoding="utf-8")
+    stale_marker = out / f"gone.png.p{dead}.tmp.complete"
+    stale_marker.write_text("", encoding="utf-8")
+
+    frames = out / f"frames_job1_p{dead}"
+    frames.mkdir()
+    (frames / ".frame_000001.tmp.png").write_bytes(b"partial")
+    (frames / "meta.json.tmp").write_text("{}", encoding="utf-8")
+    (frames / "frame_000001.png").write_bytes(b"finished")
+    live_frames = out / f"frames_job2_p{live}"
+    live_frames.mkdir()
+    (live_frames / ".frame_000001.tmp.png").write_bytes(b"in flight")
+
+    # Only temps that have stopped changing count as orphaned.
+    _backdate(orphan, frames / ".frame_000001.tmp.png", frames / "meta.json.tmp")
+
+    removed = gui_helpers.sweep_orphaned_temp_files(out)
+
+    assert removed == 4
+    assert not orphan.exists()
+    assert writing.exists()
+    assert preserved.exists()
+    assert (out / f"shot.png.p{dead}.tmp.complete").exists()
+    assert not stale_marker.exists()
+    # Finished frames survive; only the atomic-save leftovers go.
+    assert (frames / "frame_000001.png").exists()
+    assert not (frames / ".frame_000001.tmp.png").exists()
+    assert not (frames / "meta.json.tmp").exists()
+    assert (live_frames / ".frame_000001.tmp.png").exists()
+
+
+def test_sweep_spares_temps_that_are_still_being_written(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    dead = 999999999
+    temp = out / f"clip.mp4.p{dead}.temp.mp4"
+    temp.write_bytes(b"in flight")
+    frames = out / f"frames_job1_p{dead}"
+    frames.mkdir()
+    frame_temp = frames / ".frame_000001.tmp.png"
+    frame_temp.write_bytes(b"in flight")
+
+    # The pid check cannot see a writer on another account or machine, so a
+    # fresh write is what keeps its temps alive.
+    assert gui_helpers.sweep_orphaned_temp_files(out) == 0
+    assert temp.exists()
+    assert frame_temp.exists()
+
+    _backdate(temp, frame_temp)
+    assert gui_helpers.sweep_orphaned_temp_files(out) == 2
+    assert not temp.exists()
+    assert not frame_temp.exists()

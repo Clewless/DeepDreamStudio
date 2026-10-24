@@ -541,6 +541,28 @@ class TestDeepDreamGUIInit(unittest.TestCase):
         finally:
             app.destroy()
 
+    def test_main_sweeps_orphaned_temps_once(self):
+        # A crash (or a close whose bounded reap join expired) leaves
+        # pid-qualified temps that no per-pid sweep revisits; launching the app
+        # reclaims them once, and only the launch path touches the user's
+        # output folders (constructing the window does not).
+        with mock.patch.object(gui, "DeepDreamGUI") as mgui:
+            gui.main([])
+        mgui.return_value._sweep_startup_temps.assert_called_once()
+        mgui.return_value.mainloop.assert_called_once()
+
+    def test_startup_sweep_failure_is_logged_not_raised(self):
+        # The sweep is best-effort: a failure is reported in the log and must not
+        # stop the app from starting.
+        fake_app = mock.Mock()
+        failing = mock.patch.object(
+            gui, "sweep_orphaned_temp_files", side_effect=OSError("disk gone")
+        )
+        with failing:
+            gui.DeepDreamGUI._sweep_startup_temps(fake_app)
+        fake_app._log_msg.assert_called_once()
+        self.assertIn("disk gone", fake_app._log_msg.call_args.args[0])
+
     def test_gui_init_with_initial_image(self):
         from PIL import Image
 
@@ -1638,6 +1660,47 @@ class TestVideoQualitySettings(unittest.TestCase):
         cmd = self.app._build_export_request("frames", "out.mp4", 30).build_cmd()
         self.assertEqual(cmd[cmd.index("--video-quality") + 1], "lossless")
 
+    def test_crf_slider_never_changes_resolution(self):
+        # Lossless renders at 2x, so dragging the slider onto another preset's
+        # CRF must not adopt that preset's 1x geometry: the retained preset
+        # keeps the resolution and the value is reported as Custom.
+        self.app._on_video_quality_seg_change("Lossless")
+        self.app._video_crf.set(17)
+        self.assertEqual(self.app._video_quality_var.get(), "Custom")
+        self.assertEqual(self.app._video_quality_preset, "Lossless")
+        cmd = self.app._build_export_request("frames", "out.mp4", 30).build_cmd()
+        self.assertEqual(cmd[cmd.index("--video-quality") + 1], "lossless")
+        self.assertEqual(cmd[cmd.index("--crf") + 1], "17")
+
+        # The same slider position always means the same geometry: back at 12
+        # the Lossless segment is selected again instead of staying on a
+        # preset whose resolution the slider had silently swapped out.
+        self.app._video_crf.set(12)
+        self.assertEqual(self.app._video_quality_var.get(), "Lossless")
+        self.assertEqual(self.app._video_quality_preset, "Lossless")
+
+        # Within one resolution class the slider still snaps to its preset.
+        self.app._on_video_quality_seg_change("Small")
+        self.app._video_crf.set(17)
+        self.assertEqual(self.app._video_quality_var.get(), "Balanced")
+        self.assertEqual(self.app._video_quality_preset, "Balanced")
+
+    def test_custom_crf_keeps_a_segment_lit(self):
+        from app.gui_widgets import BG_PANEL
+
+        self.app._on_video_quality_seg_change("Lossless")
+        self.app._video_crf.set(10)
+        self.assertEqual(self.app._video_quality_var.get(), "Custom")
+        self.assertIn("CRF 10", self.app._video_quality_info_lbl.cget("text"))
+        lit = [
+            name
+            for name, btn in self.app._video_quality_seg._buttons.items()
+            if btn.cget("bg") != BG_PANEL
+        ]
+        # The retained geometry preset stays visible while the description
+        # carries that the CRF itself was edited.
+        self.assertEqual(lit, ["Lossless"])
+
     def test_video_quality_visibility_toggle(self):
         # Single Image mode without timelapse -> hidden
         self.app._mode_var.set("Single Image")
@@ -2700,7 +2763,7 @@ class TestVideoExport(unittest.TestCase):
             out_mp4 = os.path.join(d, "export.mp4")
             self.app._video_save_in_progress = True
             self.app._video_export_target = out_mp4
-            self.app._tracker = ProgressTracker()
+            self.app._encode_tracker = ProgressTracker()
 
             self.app._handle_encode_line("Encoding frame 10/20 (50%)\n", out_mp4)
             self.assertAlmostEqual(self.app._progress.get(), 0.5)
@@ -2719,12 +2782,54 @@ class TestVideoExport(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self._ready_job(d)
             out_mp4 = os.path.join(d, "export.mp4")
-            self.app._tracker = ProgressTracker()
+            # Lines only drain while the export owns the status bar.
+            self.app._video_save_in_progress = True
+            self.app._encode_tracker = ProgressTracker()
             event_line = format_event(EV_FRAME, current=2, total=4)
             self.app._handle_encode_line(event_line, out_mp4)
             self.assertAlmostEqual(self.app._progress.get(), 0.5)
             log_text = self.app._log.get("1.0", "end")
             self.assertNotIn(EVENT_PREFIX, log_text)
+
+    def test_encode_lines_leave_a_running_jobs_status_alone(self):
+        # Generation and export can overlap (the queue keeps running while an
+        # export encodes): the bar stays on the job, the export reports through
+        # the frames label, and neither side replaces the other's tracker.
+        with tempfile.TemporaryDirectory() as d:
+            self._ready_job(d)
+            out_mp4 = os.path.join(d, "export.mp4")
+            generation_tracker = self.app._tracker
+            self.app._queue_running = True
+            self.app._video_save_in_progress = True
+            self.app._video_export_target = out_mp4
+            self.app._encode_tracker = ProgressTracker()
+            self.app._status_label.configure(text="Dreaming 1/10")
+
+            self.app._handle_encode_line("Encoding frame 10/20 (50%)\n", out_mp4)
+            self.assertEqual(self.app._status_label.cget("text"), "Dreaming 1/10")
+            self.assertEqual(self.app._progress.get(), 0.0)
+            self.assertIn("Encoding 10/20 -> export.mp4", self.app._video_frames_label.cget("text"))
+
+            # No false "Video saved" while the job is still running.
+            self.app._handle_encode_line("Done in 1.2s -> " + out_mp4 + "\n", out_mp4)
+            self.assertEqual(self.app._status_label.cget("text"), "Dreaming 1/10")
+            self.assertIs(self.app._tracker, generation_tracker)
+
+    def test_generation_lines_leave_a_running_exports_status_alone(self):
+        # The mirror case: a job finishing mid-export must not paint "Done"
+        # over the encode's progress.
+        with tempfile.TemporaryDirectory() as d:
+            self.app._video_save_in_progress = True
+            self.app._encode_tracker = ProgressTracker()
+            self.app._status_label.configure(text="Encoding 10/20")
+            self.app._tracker = ProgressTracker()
+            self.app._log_queue.put("Octave 1/2  image 512x512\n")
+            self.app._log_queue.put("Done in 1.0s -> " + os.path.join(d, "out.png") + "\n")
+            with mock.patch.object(type(self.app), "after", return_value="poll-id"):
+                self.app._poll_log()
+            self.assertEqual(self.app._status_label.cget("text"), "Encoding 10/20")
+            self.assertEqual(self.app._progress.get(), 0.0)
+            self.app._video_save_in_progress = False
 
     def test_finish_save_success_and_failure_progress_and_playback_state(self):
         with tempfile.TemporaryDirectory() as d:

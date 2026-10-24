@@ -58,6 +58,10 @@ class VideoExportMixin:
     _video_quality_preset: str
     _video_crf: tk.IntVar
     _tracker: ProgressTracker
+    # The encode has its own tracker so a generation that starts (or keeps
+    # running) mid-export cannot have its parse state replaced, nor replace
+    # the encode's.
+    _encode_tracker: ProgressTracker
     _encode_queue: queue.Queue
     _encode_proc: Any
     _job_queue: Any
@@ -114,6 +118,7 @@ class VideoExportMixin:
         self._video_quality_preset = "Balanced"
         self._video_crf = tk.IntVar(value=17)
         self._encode_proc = None
+        self._encode_tracker = ProgressTracker()
         # Encode-subprocess events (log lines and completion) as tuples, drained
         # on the Tk thread by _poll_log so workers never touch Tk.
         self._encode_queue: queue.Queue[tuple] = queue.Queue()
@@ -263,6 +268,15 @@ class VideoExportMixin:
             name = current
         else:
             name = _CRF_TO_QUALITY.get(crf)
+            # A bare CRF never changes resolution: adopt the preset the slider
+            # landed on only when it renders at the resolution already in effect.
+            # Otherwise keep the retained preset and report a custom CRF.
+            if (
+                name is not None
+                and current in VIDEO_QUALITY_INFO
+                and VIDEO_QUALITY_INFO[name]["scale"] != VIDEO_QUALITY_INFO[current]["scale"]
+            ):
+                name = None
         if name is not None:
             self._video_quality_preset = name
             desc = VIDEO_QUALITY_INFO[name]["desc"]
@@ -279,14 +293,51 @@ class VideoExportMixin:
                 geometry = f", {self._video_quality_preset} 2× resolution"
             desc = f"Custom: {qual} (CRF {crf}{geometry}, lower = higher quality)"
 
-        if self._video_quality_seg is not None:
-            self._video_quality_seg.set(name)
-        self._video_quality_var.set(name)
+        if name == "Custom":
+            # "Custom" is no segment value, so writing it would leave every
+            # button unlit. Keep the retained geometry preset highlighted (it is
+            # what the export actually uses) and let the variable + description
+            # below carry that the CRF itself was edited.
+            self._video_quality_var.set(name)
+            if self._video_quality_seg is not None:
+                self._video_quality_seg.refresh(selected=self._video_quality_preset)
+        else:
+            if self._video_quality_seg is not None:
+                self._video_quality_seg.set(name)
+            self._video_quality_var.set(name)
         if self._video_quality_info_lbl is not None:
             self._video_quality_info_lbl.configure(text=desc)
 
     # Separated video export: generation dreams a frame sequence, and these
     # methods encode it to .mp4 at the chosen quality without re-dreaming.
+
+    # The status bar and progress widget are shared with generation, and the two
+    # jobs may overlap (a queue keeps running while an export encodes, and Save
+    # Video stays available while a job dreams). Each side owns its own tracker,
+    # and only the side that owns the bar may paint it: generation owns it while
+    # a job is queued or running, the encode only when nothing else is under way.
+    # The side that loses still reports through _video_frames_label and the log,
+    # so neither job can repaint the other's numbers or claim a false "Done".
+
+    def _encode_owns_status(self) -> bool:
+        """True when a running encode, not a generation, drives the status bar."""
+        return bool(self._video_save_in_progress and self._proc is None and not self._queue_running)
+
+    def _set_encode_status(self, text: str, color: Any) -> None:
+        if self._encode_owns_status():
+            self._status_label.configure(text=text, text_color=color)
+
+    def _set_encode_progress(self, frac: float) -> None:
+        if self._encode_owns_status():
+            self._progress.set(frac)
+
+    def _set_generation_status(self, text: str, color: Any) -> None:
+        if not self._encode_owns_status():
+            self._status_label.configure(text=text, text_color=color)
+
+    def _set_generation_progress(self, frac: float) -> None:
+        if not self._encode_owns_status():
+            self._progress.set(frac)
 
     def _has_ready_video_frames(self):
         d = self._video_frames_dir
@@ -433,9 +484,9 @@ class VideoExportMixin:
         self._video_save_in_progress = True
         self._video_export_target = path
         self._video_export_request = request
-        self._tracker = ProgressTracker()
-        self._progress.set(0)
-        self._status_label.configure(text="Encoding video...", text_color=WARNING)
+        self._encode_tracker = ProgressTracker()
+        self._set_encode_progress(0)
+        self._set_encode_status("Encoding video...", WARNING)
         self._stop_video_playback()
         self._video_export_failed = False
         self._video_export_pid = None
@@ -479,11 +530,11 @@ class VideoExportMixin:
             return
         if event is None:
             self._log_msg(line)
-        frac, status = self._tracker.update(line)
+        frac, status = self._encode_tracker.update(line)
         if frac is not None:
-            self._progress.set(frac)
+            self._set_encode_progress(frac)
         if status:
-            self._status_label.configure(text=status, text_color=WARNING)
+            self._set_encode_status(status, WARNING)
             lbl = self._video_frames_label
             if lbl is not None and self._video_save_in_progress:
                 try:
@@ -495,8 +546,8 @@ class VideoExportMixin:
                 except tk.TclError:
                     pass
         if line.strip().startswith("Done in"):
-            self._status_label.configure(text="Video saved ✓", text_color=SUCCESS)
-            self._progress.set(1.0)
+            self._set_encode_status("Video saved ✓", SUCCESS)
+            self._set_encode_progress(1.0)
 
     def _record_encode_event(self, event):
         """Keep what the encode child announced about itself until the export ends."""
@@ -527,6 +578,9 @@ class VideoExportMixin:
         read_encode_output(proc, out_path, job_id, self._encode_queue, on_line=record_event)
 
     def _finish_video_encode(self, rc, log_text, out_path, job_id):
+        # Captured before the flag clears below: once the export is no longer in
+        # progress this returns False, and the terminal status would be dropped.
+        owned_status = self._encode_owns_status()
         request = self._video_export_request
         self._video_export_request = None
         cancelled = self._video_export_cancelled
@@ -553,8 +607,9 @@ class VideoExportMixin:
             self._output_path = out_path
             self._video_last_save = out_path
             self._video_last_crf = request.crf if request is not None else None
-            self._progress.set(1.0)
-            self._status_label.configure(text="Video saved ✓", text_color=SUCCESS)
+            if owned_status:
+                self._progress.set(1.0)
+                self._status_label.configure(text="Video saved ✓", text_color=SUCCESS)
             for j in self._job_queue:
                 if getattr(j, "id", None) == job_id:
                     j.output_path = out_path
@@ -583,7 +638,8 @@ class VideoExportMixin:
             )
         else:
             self._output_path = None
-            self._progress.set(0)
+            if owned_status:
+                self._progress.set(0)
             # A killed encoder runs no cleanup, and a failed one may have been
             # killed mid-write: remove the temp files it left in the export folder.
             self._cleanup_job_temps(os.path.dirname(out_path), encode_pid)
@@ -596,9 +652,11 @@ class VideoExportMixin:
             if cancelled and not failed:
                 # _stop() terminated a healthy encode and already logged it. A
                 # failure the encoder announced before Stop is still a failure.
-                self._status_label.configure(text="Stopped", text_color=WARNING)
+                if owned_status:
+                    self._status_label.configure(text="Stopped", text_color=WARNING)
             else:
-                self._status_label.configure(text="Export failed", text_color=ERROR_COL)
+                if owned_status:
+                    self._status_label.configure(text="Export failed", text_color=ERROR_COL)
                 self._log_msg("\nVideo export failed. See the log above.\n", color=ERROR_COL)
                 try:
                     messagebox.showerror(

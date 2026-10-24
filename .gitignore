@@ -20,6 +20,7 @@ out/
 *.temp.mp4
 *.tmp.complete
 *.temp.mp4.complete
+.frame_*.tmp.png
 _gui_preview*.png
 
 # Secrets

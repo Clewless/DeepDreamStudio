@@ -15,7 +15,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw
 
-from .model_data import VIDEO_EXTENSIONS
+from .model_data import VIDEO_EXTENSIONS, VIDEO_FRAMES_META
 
 # This package's directory, and the repository root that holds .venv, out/, and
 # the launchers. Both are resolved from this file so they stay correct no matter
@@ -377,6 +377,183 @@ def terminate_process(proc: Any, force: bool = False) -> None:
             proc.terminate()
     except (OSError, AttributeError):
         pass
+
+
+# Pid-qualified atomic-save temps: "shot.png.p1234.tmp", "clip.mp4.p1234.temp.mp4"
+# and "clip.mp4.p1234.remux.temp.mp4". The pid says which process owns them.
+_PID_TEMP_RE = re.compile(r"\.p(\d+)\.(?:tmp|(?:remux\.)?temp\.mp4)$", re.IGNORECASE)
+# Frames directory naming: frames_job<id>_p<pid>.
+_FRAMES_DIR_RE = re.compile(r"^frames_job\d+_p(\d+)$", re.IGNORECASE)
+# Atomic-save leftover from a sequence frame write; no pid in the name, so it
+# belongs to whatever process owned the frames_job*_p<pid> directory.
+_SEQUENCE_TEMP_RE = re.compile(r"^\.frame_\d+\.tmp\.png$", re.IGNORECASE)
+_COMPLETE_SUFFIX = ".complete"
+# Temps written this recently are never swept. A live writer keeps refreshing its
+# temp, but its pid may belong to another account or machine that this process
+# cannot see.
+_SWEEP_GRACE_SECONDS = 5 * 60
+
+
+def pid_is_running(pid: Any) -> bool:
+    """True when pid names a live process.
+
+    Deliberately not os.kill(pid, 0): on Windows that terminates the process
+    instead of probing it.
+    """
+    if not isinstance(pid, int) or pid <= 0 or pid > 0x7FFFFFFF:
+        # Out-of-range values come from a malformed temp name, not a process;
+        # os.kill raises OverflowError for them on POSIX.
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        error_invalid_parameter = 87
+        # use_last_error makes the reason for a failed OpenProcess readable below.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Typed handles: the default c_int restype truncates a 64-bit HANDLE.
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+        open_process.restype = ctypes.c_void_p
+        get_exit_code = kernel32.GetExitCodeProcess
+        get_exit_code.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+        get_exit_code.restype = ctypes.c_int
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (ctypes.c_void_p,)
+        close_handle.restype = ctypes.c_int
+        handle = open_process(process_query_limited_information, False, pid)
+        if not handle:
+            # Only "no such pid" means the process is gone. Access denied, typically
+            # a process owned by another account, means it exists but cannot be
+            # queried, so it still counts as running.
+            return ctypes.get_last_error() != error_invalid_parameter
+        try:
+            code = ctypes.c_ulong()
+            if not get_exit_code(handle, ctypes.byref(code)):
+                return False
+            return code.value == still_active
+        finally:
+            close_handle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _remove_file(path: str) -> bool:
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def _written_recently(path: str) -> bool:
+    """True when path was modified within the grace window (False if unreadable)."""
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return False
+    return age < _SWEEP_GRACE_SECONDS
+
+
+def _sweep_pid_temps(directory: str) -> int:
+    """Drop pid-qualified temps whose owner is gone and that have gone quiet, plus stale markers.
+
+    A temp that still has its ``.complete`` sidecar is a finished output waiting
+    for manual recovery and survives, matching _cleanup_job_temps.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return 0
+    removed = 0
+    for name in names:
+        path = os.path.join(directory, name)
+        if name.lower().endswith(_COMPLETE_SUFFIX):
+            base = name[: -len(_COMPLETE_SUFFIX)]
+            if (
+                _PID_TEMP_RE.search(base)
+                and not os.path.exists(os.path.join(directory, base))
+                and _remove_file(path)
+            ):
+                removed += 1
+            continue
+        match = _PID_TEMP_RE.search(name)
+        if match is None or os.path.exists(path + _COMPLETE_SUFFIX):
+            continue
+        if pid_is_running(int(match.group(1))) or _written_recently(path):
+            continue
+        if _remove_file(path):
+            removed += 1
+    return removed
+
+
+def sweep_orphaned_temp_files(*directories: str | os.PathLike | None) -> int:
+    """Remove pid-qualified temp files left by crashed or force-killed runs.
+
+    The close-time sweep only runs while a child is still alive and the join that
+    drives it is bounded, so a crash - or a child that outlives that budget -
+    leaves ``<name>.p<pid>.temp.mp4`` and partial frame writes behind. Every
+    later sweep is scoped to one pid or one output path, so nothing revisits
+    them. The startup run covers the default output folder only: a custom folder
+    is not persisted, so one used in an earlier session is not revisited.
+
+    Temps owned by a live process are left alone (another instance may be
+    writing into the same folder), and so are temps written in the last five
+    minutes: a writer on another account or machine can look dead to the pid
+    check while it is still writing. ``.complete`` recovery pairs are preserved,
+    and finished frames are never touched - only the atomic-save temps inside a
+    frames directory owned by a process that is gone.
+    """
+    removed = 0
+    seen: set[str] = set()
+    for directory in directories:
+        if not directory:
+            continue
+        root = os.path.abspath(os.fspath(directory))
+        if root in seen or not os.path.isdir(root):
+            continue
+        seen.add(root)
+        removed += _sweep_pid_temps(root)
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for name in names:
+            match = _FRAMES_DIR_RE.match(name)
+            if match is None:
+                continue
+            frames_dir = os.path.join(root, name)
+            if not os.path.isdir(frames_dir):
+                continue
+            seen.add(os.path.abspath(frames_dir))
+            removed += _sweep_pid_temps(frames_dir)
+            # Frame writes carry no pid of their own; the directory's pid says
+            # which session they came from.
+            if pid_is_running(int(match.group(1))):
+                continue
+            try:
+                entries = os.listdir(frames_dir)
+            except OSError:
+                continue
+            for entry in entries:
+                is_temp = (
+                    _SEQUENCE_TEMP_RE.match(entry) is not None
+                    or entry == f"{VIDEO_FRAMES_META}.tmp"
+                )
+                if not is_temp:
+                    continue
+                entry_path = os.path.join(frames_dir, entry)
+                if not _written_recently(entry_path) and _remove_file(entry_path):
+                    removed += 1
+    return removed
 
 
 def _newest_matching(dir_path: str | Path, exts: tuple[str, ...]) -> str | None:
