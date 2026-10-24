@@ -6,6 +6,7 @@ it does not perform media I/O or orchestrate generation jobs.
 """
 
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import TypedDict, cast
 
 import torch
@@ -25,6 +26,45 @@ Device = str | torch.device
 Activations = dict[str, Tensor]
 ModelBuilder = Callable[[Device], nn.Module]
 LayerForward = Callable[[nn.Module, Tensor, set[str]], Activations]
+
+# Approximate download sizes for first-run messaging (weights are cached after).
+MODEL_DOWNLOAD_SIZES = {
+    "googlenet": "~28 MB",
+    "inceptionv3": "~104 MB",
+    "vgg16": "~528 MB",
+    "vgg19": "~548 MB",
+}
+
+# Map model keys to their torchvision Weights enum for cache checking.
+_MODEL_WEIGHTS_ENUM = {
+    "googlenet": models.GoogLeNet_Weights.IMAGENET1K_V1,
+    "inceptionv3": models.Inception_V3_Weights.IMAGENET1K_V1,
+    "vgg16": models.VGG16_Weights.IMAGENET1K_V1,
+    "vgg19": models.VGG19_Weights.IMAGENET1K_V1,
+}
+
+
+def weights_cached(model_key: str) -> bool:
+    """True if the model's pretrained weights are already in the torch hub cache."""
+    weights_enum = _MODEL_WEIGHTS_ENUM.get(model_key)
+    if weights_enum is None:
+        return True
+    try:
+        cache_dir = Path(torch.hub.get_dir())
+        filename = Path(weights_enum.url).name
+        return (cache_dir / "checkpoints" / filename).exists() or (cache_dir / filename).exists()
+    except (OSError, AttributeError):
+        return True  # Assume cached if we can't check; the load will fail clearly.
+
+
+def announce_model_download(model_key: str) -> None:
+    """Print a first-run download notice when weights are not yet cached."""
+    if not weights_cached(model_key):
+        size = MODEL_DOWNLOAD_SIZES.get(model_key, "")
+        print(
+            f"Downloading pretrained weights {size} (first run only; cached for later runs)...",
+            flush=True,
+        )
 
 
 class ModelSpec(TypedDict):

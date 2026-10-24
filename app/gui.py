@@ -103,7 +103,6 @@ from .gui_widgets import (
 from .imagenet_categories import lookup_category
 from .model_data import (
     DEFAULT_MODEL_KEY,
-    DEFAULT_MODEL_LABEL,
     MAX_NAME_LEN,
     MODEL_BY_LABEL,
     MODEL_KEYS,
@@ -115,6 +114,7 @@ from .model_data import (
     read_video_frames_meta,
 )
 from .protocol import EV_DONE, EV_PID, EV_PREVIEW, parse_event
+from .settings import add_recent_file, filter_existing_files, load_settings, save_settings
 
 __all__ = ["DeepDreamGUI", "main"]
 
@@ -326,6 +326,9 @@ class DeepDreamGUI(
     def __init__(self, initial_image=None):
         super().__init__()
 
+        # Load persisted settings (model, parameters, output dir, etc.)
+        self._settings = load_settings()
+
         # UI widget handles populated during _build_ui
         self._zoom_focus_label: Any = None
         self._status_label: Any = None
@@ -340,50 +343,124 @@ class DeepDreamGUI(
         self._queue_inner: Any = None
 
         self.title(f"DeepDream Studio {__version__}")
-        self.geometry("1180x780")
+        # Restore window geometry from settings, or use default.
+        saved_geom = self._settings.get("window_geometry")
+        if saved_geom and isinstance(saved_geom, str):
+            try:
+                self.geometry(saved_geom)
+            except tk.TclError:
+                self.geometry("1180x780")
+        else:
+            self.geometry("1180x780")
         self.minsize(900, 640)
         _apply_modern_style(self)
         self.configure(bg=BG_DEEP)
 
+        # Restore model selection from settings.
+        saved_model_key = self._settings.get("model_key", DEFAULT_MODEL_KEY)
+        if saved_model_key not in MODEL_META:
+            saved_model_key = DEFAULT_MODEL_KEY
+        saved_model_label = MODEL_META[saved_model_key]["label"]
+
         self._image_path = tk.StringVar()
-        self._out_dir = tk.StringVar(value=resolve_out_dir(""))
-        self._model_var = tk.StringVar(value=DEFAULT_MODEL_LABEL)
-        self._layer_var = tk.StringVar(value=MODEL_META[DEFAULT_MODEL_KEY]["recommended"])
-        _defs = MODEL_META[DEFAULT_MODEL_KEY]["defaults"]
-        self._iterations = tk.IntVar(value=_defs["iterations"])
-        self._octaves = tk.IntVar(value=_defs["octaves"])
-        self._octave_scale = tk.DoubleVar(value=_defs["octave_scale"])
-        self._lr = tk.DoubleVar(value=_defs["lr"])
-        self._size = tk.IntVar(value=_defs["size"])
-        self._jitter = tk.IntVar(value=_defs["jitter"])
-        self._save_frames = tk.BooleanVar(value=False)
-        self._no_cuda = tk.BooleanVar(value=False)
+        # Restore output directory from settings.
+        saved_out_dir = self._settings.get("out_dir") or ""
+        self._out_dir = tk.StringVar(value=resolve_out_dir(saved_out_dir))
+        self._model_var = tk.StringVar(value=saved_model_label)
+        _defs = MODEL_META[saved_model_key]["defaults"]
+        # Restore layer: saved layer key, or model's recommended.
+        saved_layer = self._settings.get("layer_key")
+        if saved_layer and any(k == saved_layer for k, _ in MODEL_META[saved_model_key]["layers"]):
+            layer_display = dict(MODEL_META[saved_model_key]["layers"])[saved_layer]
+        else:
+            layer_display = MODEL_META[saved_model_key]["recommended"]
+        self._layer_var = tk.StringVar(value=layer_display)
+        # Restore parameters: saved value, or model default.
+        self._iterations = tk.IntVar(value=self._settings.get("iterations") or _defs["iterations"])
+        self._octaves = tk.IntVar(
+            value=self._settings.get("octaves")
+            if self._settings.get("octaves") is not None
+            else _defs["octaves"]
+        )
+        self._octave_scale = tk.DoubleVar(
+            value=self._settings.get("octave_scale") or _defs["octave_scale"]
+        )
+        self._lr = tk.DoubleVar(value=self._settings.get("lr") or _defs["lr"])
+        self._size = tk.IntVar(value=self._settings.get("size") or _defs["size"])
+        self._jitter = tk.IntVar(
+            value=self._settings.get("jitter")
+            if self._settings.get("jitter") is not None
+            else _defs["jitter"]
+        )
+        self._save_frames = tk.BooleanVar(value=bool(self._settings.get("save_frames", False)))
+        self._no_cuda = tk.BooleanVar(value=bool(self._settings.get("no_cuda", False)))
         self._custom_name = tk.StringVar()
 
         # Mode & presets
-        self._mode_var = tk.StringVar(value="Single Image")
-        self._previous_mode = "Single Image"
-        self._saved_single_image_iters = self._iterations.get()
+        saved_mode = self._settings.get("mode", "Single Image")
+        if saved_mode not in ("Single Image", "Dream Zoom", "Dream Video"):
+            saved_mode = "Single Image"
+        self._mode_var = tk.StringVar(value=saved_mode)
+        self._previous_mode = saved_mode
+        saved_single_iters = self._settings.get("single_image_iters")
+        self._saved_single_image_iters = int(_defs["iterations"])
+        if saved_single_iters is not None:
+            try:
+                parsed_iters = int(saved_single_iters)
+            except (TypeError, ValueError):
+                parsed_iters = 0
+            if parsed_iters >= 1:
+                self._saved_single_image_iters = parsed_iters
+        elif saved_mode == "Single Image":
+            self._saved_single_image_iters = self._iterations.get()
         self._preset_var = tk.StringVar(value="Select a preset...")
 
         # Guidance
-        self._guidance_mode_var = tk.StringVar(value="Unguided")
-        self._guide_path = tk.StringVar(value="")
+        saved_guidance = self._settings.get("guidance_mode", "Unguided")
+        if saved_guidance not in ("Unguided", "Guide Image", "Target Class"):
+            saved_guidance = "Unguided"
+        saved_guide_path = str(self._settings.get("guide_path") or "")
+        saved_target_class = str(self._settings.get("target_class") or "")
+        if saved_guidance == "Guide Image" and not os.path.isfile(saved_guide_path):
+            saved_guidance = "Unguided"
+        if saved_guidance == "Target Class" and lookup_category(saved_target_class) is None:
+            saved_guidance = "Unguided"
+        self._guidance_mode_var = tk.StringVar(value=saved_guidance)
+        self._guide_path = tk.StringVar(value=saved_guide_path)
         self._init_target_class_state()
 
         # Multi-layer
         self._init_layer_state()
 
         # Video & animation options
-        self._timelapse = tk.BooleanVar(value=False)
-        self._zoom_frames = tk.IntVar(value=60)
-        self._zoom_scale = tk.DoubleVar(value=1.03)
-        self._zoom_rot = tk.DoubleVar(value=0.0)
-        self._zoom_fps = tk.IntVar(value=30)
-        self._zoom_cx = tk.DoubleVar(value=0.5)
-        self._zoom_cy = tk.DoubleVar(value=0.5)
-        self._video_blend = tk.DoubleVar(value=0.5)
+        self._timelapse = tk.BooleanVar(value=bool(self._settings.get("timelapse", False)))
+        self._zoom_frames = tk.IntVar(value=self._settings.get("zoom_frames") or 60)
+        self._zoom_scale = tk.DoubleVar(value=self._settings.get("zoom_scale") or 1.03)
+        self._zoom_rot = tk.DoubleVar(value=self._settings.get("zoom_rot") or 0.0)
+        self._zoom_fps = tk.IntVar(value=self._settings.get("zoom_fps") or 30)
+        self._zoom_cx = tk.DoubleVar(
+            value=self._settings.get("zoom_cx")
+            if self._settings.get("zoom_cx") is not None
+            else 0.5
+        )
+        self._zoom_cy = tk.DoubleVar(
+            value=self._settings.get("zoom_cy")
+            if self._settings.get("zoom_cy") is not None
+            else 0.5
+        )
+        self._video_blend = tk.DoubleVar(value=self._settings.get("video_blend") or 0.5)
         self._init_video_export_state()
+        # Restore video quality settings.
+        saved_vq = self._settings.get("video_quality", "Balanced")
+        if saved_vq in ("Small", "Balanced", "Lossless"):
+            self._video_quality_var.set(saved_vq)
+            self._video_quality_preset = saved_vq
+        saved_crf = self._settings.get("video_crf")
+        if saved_crf is not None:
+            try:
+                self._video_crf.set(int(saved_crf))
+            except (TypeError, ValueError):
+                pass
 
         # Before / After comparison state
         self._input_pil = None
@@ -456,6 +533,12 @@ class DeepDreamGUI(
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
+        self._on_mode_change(saved_mode)
+        self._on_guidance_change(saved_guidance)
+        if saved_guidance == "Guide Image":
+            self._load_guide_preview(saved_guide_path)
+        elif saved_guidance == "Target Class":
+            self._target_class_var.set(saved_target_class)
 
         self.bind("<Left>", lambda e: self._on_arrow_nudge(-1, e))
         self.bind("<Down>", lambda e: self._on_arrow_nudge(-1, e))
@@ -578,10 +661,65 @@ class DeepDreamGUI(
             t = threading.Thread(target=_reap, daemon=True)
             t.start()
             t.join(timeout=3.0)
+        self._save_settings()
         self._cleanup_preview_temps()
         for row in self._slider_registry:
             row.dispose()
         self.destroy()
+
+    def _collect_settings(self) -> dict[str, Any]:
+        """Gather current UI state into a settings dict for persistence."""
+        settings = dict(self._settings) if hasattr(self, "_settings") else {}
+        try:
+            model_key = MODEL_BY_LABEL.get(self._model_var.get(), DEFAULT_MODEL_KEY)
+            settings["model_key"] = model_key
+            # Save layer key (not display label).
+            layer_map = layer_value_map(model_key)
+            settings["layer_key"] = layer_map.get(self._layer_var.get())
+            settings["iterations"] = self._iterations.get()
+            settings["octaves"] = self._octaves.get()
+            settings["octave_scale"] = self._octave_scale.get()
+            settings["lr"] = self._lr.get()
+            settings["size"] = self._size.get()
+            settings["jitter"] = self._jitter.get()
+            settings["out_dir"] = self._out_dir.get()
+            settings["mode"] = self._mode_var.get()
+            settings["single_image_iters"] = (
+                self._iterations.get()
+                if self._mode_var.get() == "Single Image"
+                else self._saved_single_image_iters
+            )
+            settings["guidance_mode"] = self._guidance_mode_var.get()
+            settings["guide_path"] = self._guide_path.get()
+            settings["target_class"] = self._target_class_var.get()
+            settings["timelapse"] = bool(self._timelapse.get())
+            settings["save_frames"] = bool(self._save_frames.get())
+            settings["no_cuda"] = bool(self._no_cuda.get())
+            settings["zoom_frames"] = self._zoom_frames.get()
+            settings["zoom_scale"] = self._zoom_scale.get()
+            settings["zoom_rot"] = self._zoom_rot.get()
+            settings["zoom_fps"] = self._zoom_fps.get()
+            settings["zoom_cx"] = self._zoom_cx.get()
+            settings["zoom_cy"] = self._zoom_cy.get()
+            settings["video_blend"] = self._video_blend.get()
+            settings["video_quality"] = self._video_quality_var.get()
+            settings["video_crf"] = self._video_crf.get()
+            # Save window geometry.
+            try:
+                settings["window_geometry"] = self.geometry()
+            except tk.TclError:
+                pass
+        except (tk.TclError, AttributeError):
+            pass
+        return settings
+
+    def _save_settings(self) -> None:
+        """Persist current UI state to disk. Best-effort: never blocks closing."""
+        try:
+            settings = self._collect_settings()
+            save_settings(settings)
+        except Exception:
+            pass  # Settings save must never prevent the app from closing.
 
     def report_callback_exception(self, exc, val, tb):
         """Surface unhandled Tk callback errors to the console pane and a dialog.
@@ -685,10 +823,11 @@ class DeepDreamGUI(
     def _build_sidebar_presets(self, sb):
         # Presets
         self._section(sb, row=3, label="Preset")
+        _init_model_key = MODEL_BY_LABEL.get(self._model_var.get(), DEFAULT_MODEL_KEY)
         self._preset_menu = ModernOptionMenu(
             sb,
             variable=self._preset_var,
-            values=presets_for_model(DEFAULT_MODEL_KEY),
+            values=presets_for_model(_init_model_key),
             fg_color=BG_CARD,
             button_color=ACCENT,
             button_hover_color=ACCENT_HOVER,
@@ -853,9 +992,10 @@ class DeepDreamGUI(
             "• VGG19: Deeper still; detailed textures.",
         )
 
+        _init_model_key = MODEL_BY_LABEL.get(self._model_var.get(), DEFAULT_MODEL_KEY)
         self._model_desc_label = ModernLabel(
             model_card,
-            text=MODEL_META[DEFAULT_MODEL_KEY]["description"],
+            text=MODEL_META[_init_model_key]["description"],
             font=ModernFont(family="Segoe UI", size=10),
             text_color=TEXT_DIM,
             anchor="w",
@@ -2038,6 +2178,10 @@ class DeepDreamGUI(
             # Remember what is being replaced so the drop-zone context menu's
             # Undo action can restore it (None = the empty state).
             self._push_input_history(previous or None)
+        # Track in recent files for the File menu.
+        if hasattr(self, "_settings"):
+            add_recent_file(self._settings, path)
+            self._refresh_recent_files_menu()
         self._image_path.set(path)
         self._input_pil = pil.copy()
         self._input_pil_path = os.path.normcase(os.path.abspath(path))
@@ -2101,7 +2245,7 @@ class DeepDreamGUI(
         del history[:-20]  # cap undo depth
 
     def _show_drop_zone_menu(self, event):
-        """Right-click menu on the input drop zone: Open Directory / Clear / Undo."""
+        """Right-click menu on the input drop zone: Open Directory / Clear / Undo / Recent Files."""
         menu = tk.Menu(
             self,
             tearoff=0,
@@ -2127,6 +2271,33 @@ class DeepDreamGUI(
             command=self._undo_input_image,
             state="normal" if self._input_history else "disabled",
         )
+        # Recent Files submenu.
+        recent = self._get_recent_files()
+        if recent:
+            menu.add_separator()
+            recent_menu = tk.Menu(
+                menu,
+                tearoff=0,
+                bg=BG_PANEL,
+                fg=TEXT_MAIN,
+                activebackground=BORDER,
+                activeforeground=ACCENT_HOVER,
+                font=ModernFont(family="Segoe UI", size=10),
+            )
+            for i, path in enumerate(recent, 1):
+                label = f"{i}. {os.path.basename(path)}"
+                if len(label) > 50:
+                    label = label[:47] + "..."
+                recent_menu.add_command(
+                    label=label,
+                    command=self._make_recent_file_loader(path),
+                )
+            recent_menu.add_separator()
+            recent_menu.add_command(
+                label="Clear Recent Files",
+                command=self._clear_recent_files,
+            )
+            menu.add_cascade(label="Recent Files", menu=recent_menu)
         # Keep a reference: a local-only Menu can be garbage-collected while
         # still posted on some Tk builds.
         self._drop_zone_menu = menu
@@ -2134,6 +2305,49 @@ class DeepDreamGUI(
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _get_recent_files(self) -> list[str]:
+        """Return the list of recent files that still exist on disk."""
+        if not hasattr(self, "_settings"):
+            return []
+        recent = self._settings.get("recent_files") or []
+        return filter_existing_files(recent)
+
+    def _make_recent_file_loader(self, path: str):
+        """Return a callable that loads the given recent file path."""
+
+        def _load():
+            self._load_recent_file(path)
+
+        return _load
+
+    def _refresh_recent_files_menu(self) -> None:
+        """Placeholder for refreshing a persistent recent-files menu (if added later)."""
+        pass
+
+    def _load_recent_file(self, path: str) -> None:
+        """Load a file from the recent-files list."""
+        if os.path.isfile(path):
+            self._load_image_preview(path)
+        else:
+            messagebox.showwarning(
+                "File not found",
+                f"The file no longer exists:\n{path}",
+            )
+            # Remove from recent files.
+            if hasattr(self, "_settings"):
+                recent = self._settings.get("recent_files") or []
+                self._settings["recent_files"] = [
+                    p
+                    for p in recent
+                    if os.path.normcase(os.path.abspath(p))
+                    != os.path.normcase(os.path.abspath(path))
+                ]
+
+    def _clear_recent_files(self) -> None:
+        """Clear the recent files list."""
+        if hasattr(self, "_settings"):
+            self._settings["recent_files"] = []
 
     def _open_input_directory(self):
         """Open the folder containing the loaded input, file highlighted when possible."""
@@ -3320,7 +3534,11 @@ class DeepDreamGUI(
                 pass
         self._stop_btn.configure(state="normal", text_color=TEXT_MAIN)
         self._set_generation_progress(0)
-        self._set_generation_status(f"Job #{job.id} starting\u2026", WARNING)
+        # Show batch progress in the status label when running multiple jobs.
+        if total > 1:
+            self._set_generation_status(f"Job {idx}/{total}: {Path(job.image_path).name}", WARNING)
+        else:
+            self._set_generation_status(f"Job #{job.id} starting…", WARNING)
         self._open_dir_btn.grid_remove()
         try:
             self._view_image_btn.grid_remove()
@@ -4006,8 +4224,14 @@ class DeepDreamGUI(
     def _get_queue_badge_text(self):
         pending = sum(1 for j in self._job_queue if j.status == "Pending")
         running = sum(1 for j in self._job_queue if j.status == "Running")
+        processed = sum(1 for j in self._job_queue if j.status in ("Done", "Failed", "Stopped"))
         active = pending + running
+        total = len(self._job_queue)
         if active > 0:
+            # Show "Job X of Y" when a batch is running, with progress count.
+            if total > 1:
+                current_idx = processed + 1
+                return f"Job {current_idx}/{total}"
             return f"Queue ({active})"
         elif self._job_queue:
             return f"Queue ({len(self._job_queue)})"
@@ -4018,13 +4242,13 @@ class DeepDreamGUI(
         cur = self._bottom_tab_seg.get()
         new_values = ["Console Output", badge_text]
         self._bottom_tab_seg.configure(values=new_values)
-        if cur.startswith("Queue"):
+        if cur != "Console Output":
             self._bottom_tab_seg.set(badge_text)
         else:
             self._bottom_tab_seg.set("Console Output")
 
     def _on_bottom_tab_change(self, tab):
-        if tab.startswith("Queue"):
+        if tab != "Console Output":
             self._log.grid_remove()
             self._clear_log_btn.grid_remove()
             self._queue_action_frame.grid(row=0, column=1, sticky="e")

@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest import mock
 
 import numpy as np
@@ -538,6 +538,38 @@ class TestDeepDreamGUIInit(unittest.TestCase):
         try:
             app._refresh_slider_labels()
             self.assertGreater(len(app._slider_registry), 0)
+        finally:
+            app.destroy()
+
+    def test_restores_video_mode_and_target_guidance_visibility(self):
+        payload = dict(gui.load_settings())
+        payload.update(
+            {
+                "mode": "Dream Video",
+                "guidance_mode": "Target Class",
+                "target_class": "pizza",
+                "single_image_iters": 40,
+            }
+        )
+        with mock.patch.object(gui, "load_settings", return_value=payload):
+            app = gui.DeepDreamGUI()
+        try:
+            self.assertEqual(app._mode_var.get(), "Dream Video")
+            self.assertIn("row", app._video_frame.grid_info())
+            self.assertIn("row", app._class_frame.grid_info())
+            self.assertEqual(app._target_class_var.get(), "pizza")
+            self.assertEqual(app._saved_single_image_iters, 40)
+        finally:
+            app.destroy()
+
+    def test_restores_timelapse_video_quality_visibility(self):
+        payload = dict(gui.load_settings())
+        payload.update({"mode": "Single Image", "timelapse": True})
+        with mock.patch.object(gui, "load_settings", return_value=payload):
+            app = gui.DeepDreamGUI()
+        try:
+            self.assertTrue(app._timelapse.get())
+            self.assertIn("row", app._video_quality_frame.grid_info())
         finally:
             app.destroy()
 
@@ -1149,6 +1181,37 @@ class TestGenerationQueue(unittest.TestCase):
         self.assertEqual(len(self.app._job_queue), 1)
         self.assertEqual(self.app._get_queue_badge_text(), "Queue (1)")
         self.assertIn("Queue (1)", self.app._bottom_tab_seg.cget("values"))
+
+    def test_batch_badge_keeps_queue_tab_active(self):
+        jobs = [
+            GenerationJob(
+                id=idx,
+                image_path=f"img{idx}.jpg",
+                model_key="googlenet",
+                layer_spec="inception4c",
+                iterations=20,
+                octaves=0,
+                octave_scale=1.4,
+                lr=0.03,
+                size=512,
+                jitter=32,
+                out_dir="out",
+                status=cast(Any, status),
+            )
+            for idx, status in enumerate(("Failed", "Running", "Pending"), start=1)
+        ]
+        self.app._job_queue.extend(jobs)
+
+        badge_text = self.app._get_queue_badge_text()
+        self.assertEqual(badge_text, "Job 2/3")
+
+        self.app._bottom_tab_seg.set(badge_text)
+        self.app._update_queue_badge()
+        self.assertEqual(self.app._bottom_tab_seg.get(), badge_text)
+
+        self.app._on_bottom_tab_change(badge_text)
+        self.assertIn("row", self.app._queue_container.grid_info())
+        self.assertEqual(self.app._log.grid_info(), {})
 
     def test_remove_job_and_clear_pending(self):
         job1 = GenerationJob(

@@ -76,6 +76,7 @@ from .model_data import (
 from .models import (
     MODEL_REGISTRY,
     Device,
+    announce_model_download,
     build_model,
     forward_with_activations,
     resolve_layer,
@@ -138,9 +139,18 @@ def _configure_streams() -> None:
 
 
 def _parse_version(v_str: str) -> tuple[int, ...]:
-    """Parse a semver-like version string into a comparable tuple of integers."""
-    parts = tuple(int(x) for x in v_str.split("+")[0].split(".")[:3] if x.isdigit())
-    return parts + (0,) * (3 - len(parts))
+    """Parse a semver-like version string into a comparable tuple of integers.
+
+    Extracts the leading numeric portion of each dot-separated component, so
+    pre-release suffixes (``2.4.1rc1``) and build metadata (``2.4.1+cu118``)
+    parse correctly: ``2.4.1rc1`` -> ``(2, 4, 1)``.
+    """
+    parts = []
+    for component in v_str.split("+")[0].split(".")[:3]:
+        match = re.match(r"\d+", component)
+        if match:
+            parts.append(int(match.group()))
+    return tuple(parts) + (0,) * (3 - len(parts))
 
 
 def check_runtime_environment() -> None:
@@ -2536,6 +2546,7 @@ def _init_device_and_model(
 
     print(_device_desc(device), flush=True)
     model_desc = MODEL_REGISTRY[model_key]["description"]
+    announce_model_download(model_key)
     print(f"Loading {model_desc}...", flush=True)
     try:
         model = build_model(model_key, device)

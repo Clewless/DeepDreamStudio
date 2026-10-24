@@ -168,10 +168,11 @@ class LayerPanelMixin:
         self._single_layer_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
         self._single_layer_frame.grid_columnconfigure(0, weight=1)
 
+        _init_model_key = MODEL_BY_LABEL.get(self._model_var.get(), DEFAULT_MODEL_KEY)
         self._layer_menu = ModernOptionMenu(
             self._single_layer_frame,
             variable=self._layer_var,
-            values=layer_display_list(DEFAULT_MODEL_KEY),
+            values=layer_display_list(_init_model_key),
             command=self._on_single_layer_select,
             fg_color=BG_PANEL,
             button_color=ACCENT,

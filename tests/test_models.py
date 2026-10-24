@@ -1,5 +1,7 @@
 """Backend boundary tests that do not download pretrained weights."""
 
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
@@ -32,3 +34,18 @@ def test_activation_targets_can_be_a_single_pass_iterable() -> None:
     logits.sum().backward()
     assert x.grad is not None
     assert all(not module._forward_hooks for module in model)
+
+
+def test_weights_cached_checks_torchvision_checkpoint_dir(tmp_path, monkeypatch) -> None:
+    from torchvision.models import VGG16_Weights
+
+    from app.models import weights_cached
+
+    monkeypatch.setattr(torch.hub, "get_dir", lambda: str(tmp_path))
+    filename = Path(VGG16_Weights.IMAGENET1K_V1.url).name
+
+    assert not weights_cached("vgg16")
+    checkpoint = tmp_path / "checkpoints" / filename
+    checkpoint.parent.mkdir()
+    checkpoint.touch()
+    assert weights_cached("vgg16")

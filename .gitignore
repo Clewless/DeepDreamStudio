@@ -13,6 +13,9 @@ __pycache__/
 # Generated content
 out/
 
+# Per-install GUI preferences (contains absolute user paths)
+deepdream-settings.json
+
 # DeepDream transient temps (atomic saves, video encodes, live previews).
 # Normally under out/, but --out / --frames-dir / --preview-file can point
 # anywhere, so ignore by pattern too.

@@ -32,6 +32,14 @@ def _auto_skip_gui_if_headless(request: pytest.FixtureRequest) -> None:
         pytest.skip("Tk display not available (headless environment)")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests from reading or writing the developer's real settings file."""
+    from app import settings
+
+    monkeypatch.setattr(settings, "settings_path", lambda: tmp_path / settings.SETTINGS_FILENAME)
+
+
 @pytest.fixture
 def tk_root():
     """Create and yield a temporary Tk root window, safely destroying it on teardown."""

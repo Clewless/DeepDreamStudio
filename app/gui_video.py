@@ -184,7 +184,9 @@ class VideoExportMixin:
 
         self._video_quality_info_lbl = ModernLabel(
             self._video_quality_frame,
-            text=VIDEO_QUALITY_INFO["Balanced"]["desc"],
+            text=VIDEO_QUALITY_INFO.get(
+                self._video_quality_var.get(), VIDEO_QUALITY_INFO["Balanced"]
+            )["desc"],
             font=ModernFont(family="Segoe UI", size=10),
             text_color=TEXT_LABEL,
             anchor="w",
